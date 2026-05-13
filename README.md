@@ -7,7 +7,7 @@ Paper-only crypto strategy monitor for Render.
 Build command:
 
 ```bash
-pip install -r requirements.txt
+python3 -m pip install --upgrade pip && python3 -m pip install -r requirements.txt
 ```
 
 Start command:

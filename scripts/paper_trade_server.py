@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -141,18 +142,30 @@ class PostgresStateStore:
     backend = "postgres"
 
     def __init__(self, database_url, state_id=STATE_ID):
-        import psycopg
+        try:
+            import psycopg
+
+            self.driver = "psycopg"
+            self.db_module = psycopg
+        except ImportError:
+            import psycopg2
+
+            self.driver = "psycopg2"
+            self.db_module = psycopg2
 
         self.database_url = database_url
         self.state_id = state_id
-        self.psycopg = psycopg
         self.init_schema()
 
     def connect(self):
-        return self.psycopg.connect(self.database_url, autocommit=True)
+        if self.driver == "psycopg":
+            return self.db_module.connect(self.database_url, autocommit=True)
+        conn = self.db_module.connect(self.database_url)
+        conn.autocommit = True
+        return conn
 
     def init_schema(self):
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -181,7 +194,7 @@ class PostgresStateStore:
                 )
 
     def load(self, default):
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT payload FROM paper_trade_state WHERE id = %s", (self.state_id,))
                 row = cur.fetchone()
@@ -193,7 +206,7 @@ class PostgresStateStore:
         return payload
 
     def save(self, payload):
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -208,7 +221,7 @@ class PostgresStateStore:
     def record_trades(self, rows):
         if not rows:
             return None
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             with conn.cursor() as cur:
                 for row in rows:
                     trade_id = row.get("paper_trade_key") or trade_key(row)
