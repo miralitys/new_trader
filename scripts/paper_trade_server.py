@@ -370,8 +370,10 @@ class PaperTradeApp:
         self.state["market"] = args.market
         self.state["modules"] = list(args.modules)
         self.state["monitor_universe"] = args.monitor_universe
+        self.state["monitor_every_cycles"] = args.monitor_every_cycles
         self.state["interval_sec"] = args.interval_sec
         self.state["monitor_enabled"] = not args.skip_monitor
+        self.state["auto_cycle_count"] = int(self.state.get("auto_cycle_count") or 0)
         self.state["storage_backend"] = self.store.backend
         self.state["storage_error"] = storage_error
         self.state["auth_enabled"] = bool(self.auth_password)
@@ -432,6 +434,11 @@ class PaperTradeApp:
             if self.in_cycle:
                 return {"status": "already_running"}
             self.in_cycle = True
+            if manual:
+                auto_cycle_number = self.state.get("auto_cycle_count", 0)
+            else:
+                auto_cycle_number = int(self.state.get("auto_cycle_count") or 0) + 1
+                self.state["auto_cycle_count"] = auto_cycle_number
             self.state["last_error"] = ""
             self.save_state()
 
@@ -490,9 +497,17 @@ class PaperTradeApp:
         if self.args.monitor_skip_stress:
             monitor_cmd.append("--skip-stress")
 
+        monitor_every = max(1, int(self.args.monitor_every_cycles or 1))
+        run_monitor = (
+            not self.args.skip_monitor
+            and (manual or auto_cycle_number == 1 or auto_cycle_number % monitor_every == 0)
+        )
+
         cycle = {
             "started_at": utc_now(),
             "manual": manual,
+            "auto_cycle_number": auto_cycle_number,
+            "monitor_due": run_monitor,
             "journal_path": journal_rel,
             "summary_path": summary_rel,
             "monitor_path": monitor_rel,
@@ -504,19 +519,28 @@ class PaperTradeApp:
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             LOG_DIR.mkdir(parents=True, exist_ok=True)
-            write_module_universe(self.args.modules, ROOT / universe_rel, self.args.monitor_universe)
             cycle["journal"] = self.run_subprocess(journal_cmd)
             if cycle["journal"]["returncode"] != 0:
                 raise RuntimeError(cycle["journal"]["output"])
 
-            if not self.args.skip_monitor:
+            if run_monitor:
+                write_module_universe(self.args.modules, ROOT / universe_rel, self.args.monitor_universe)
                 cycle["monitor"] = self.run_subprocess(monitor_cmd)
                 if cycle["monitor"]["returncode"] != 0:
                     raise RuntimeError(cycle["monitor"]["output"])
+            else:
+                cycle["monitor"] = {
+                    "skipped": True,
+                    "reason": f"Operational monitor runs every {monitor_every} paper cycles.",
+                }
 
             journal_rows = read_csv(ROOT / journal_rel)
             summary_rows = read_csv(ROOT / summary_rel)
-            monitor_rows = read_csv(ROOT / monitor_rel) if not self.args.skip_monitor else []
+            if run_monitor:
+                monitor_rows = read_csv(ROOT / monitor_rel)
+            else:
+                with self.lock:
+                    monitor_rows = list(self.state.get("latest_monitor", []))
             filled = [
                 row
                 for row in journal_rows
@@ -2061,6 +2085,12 @@ def parse_args():
         choices=["all", "modules"],
         default="all",
         help="Use all fixed strategies in the operational monitor, or only the selected paper modules.",
+    )
+    parser.add_argument(
+        "--monitor-every-cycles",
+        type=int,
+        default=15,
+        help="Run the heavier operational monitor every N paper cycles; manual Run Once always runs it.",
     )
     parser.add_argument("--monitor-days", type=int, default=7)
     parser.add_argument("--monitor-stress-window", type=int, default=7)
