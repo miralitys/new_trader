@@ -11,6 +11,7 @@ import argparse
 import csv
 import html
 import json
+import math
 import os
 import subprocess
 import sys
@@ -26,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data" / "paper_live"
 LOG_DIR = ROOT / "logs"
 STATE_PATH = DATA_DIR / "state.json"
+STATE_ID = os.environ.get("PAPER_STATE_ID", "default")
 MAX_LEDGER_ROWS = 1000
 DEFAULT_MODULES = ("RIF", "GALA_10", "GALA_112", "ANKR", "SPELL", "DYDX_X2")
 MODULE_STRATEGIES = {
@@ -76,6 +78,14 @@ def safe_float(value):
         return 0.0
 
 
+def nullable_float(value):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 def load_json(path, default):
     if not path.exists():
         return default
@@ -93,6 +103,156 @@ def save_json(path, payload):
         json.dump(payload, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
     os.replace(tmp, path)
+
+
+def default_state(args):
+    return {
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "mode": "paper_only",
+        "market": args.market,
+        "modules": list(args.modules),
+        "interval_sec": args.interval_sec,
+        "last_run_at": "",
+        "last_error": "",
+        "storage_backend": "local_json",
+        "storage_error": "",
+        "last_cycle": {},
+        "ledger_summary": {},
+        "ledger": [],
+        "seen_trade_keys": [],
+    }
+
+
+class LocalStateStore:
+    backend = "local_json"
+
+    def load(self, default):
+        return load_json(STATE_PATH, default)
+
+    def save(self, payload):
+        save_json(STATE_PATH, payload)
+
+    def record_trades(self, rows):
+        return None
+
+
+class PostgresStateStore:
+    backend = "postgres"
+
+    def __init__(self, database_url, state_id=STATE_ID):
+        import psycopg
+
+        self.database_url = database_url
+        self.state_id = state_id
+        self.psycopg = psycopg
+        self.init_schema()
+
+    def connect(self):
+        return self.psycopg.connect(self.database_url, autocommit=True)
+
+    def init_schema(self):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS paper_trade_state (
+                        id text PRIMARY KEY,
+                        payload jsonb NOT NULL,
+                        updated_at timestamptz NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS paper_trade_trades (
+                        trade_key text PRIMARY KEY,
+                        recorded_at timestamptz NOT NULL,
+                        asset text,
+                        symbol text,
+                        strategy text,
+                        module text,
+                        direction text,
+                        net_return_pct double precision,
+                        portfolio_return_pct double precision,
+                        row_json jsonb NOT NULL
+                    )
+                    """
+                )
+
+    def load(self, default):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT payload FROM paper_trade_state WHERE id = %s", (self.state_id,))
+                row = cur.fetchone()
+        if not row:
+            return default
+        payload = row[0]
+        if isinstance(payload, str):
+            return json.loads(payload)
+        return payload
+
+    def save(self, payload):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO paper_trade_state (id, payload, updated_at)
+                    VALUES (%s, %s::jsonb, now())
+                    ON CONFLICT (id)
+                    DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()
+                    """,
+                    (self.state_id, json.dumps(payload, ensure_ascii=False)),
+                )
+
+    def record_trades(self, rows):
+        if not rows:
+            return None
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                for row in rows:
+                    trade_id = row.get("paper_trade_key") or trade_key(row)
+                    cur.execute(
+                        """
+                        INSERT INTO paper_trade_trades (
+                            trade_key,
+                            recorded_at,
+                            asset,
+                            symbol,
+                            strategy,
+                            module,
+                            direction,
+                            net_return_pct,
+                            portfolio_return_pct,
+                            row_json
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                        ON CONFLICT (trade_key) DO NOTHING
+                        """,
+                        (
+                            trade_id,
+                            row.get("recorded_at") or utc_now(),
+                            row.get("asset"),
+                            row.get("symbol"),
+                            row.get("strategy"),
+                            row.get("module"),
+                            row.get("direction"),
+                            nullable_float(row.get("net_return_pct")),
+                            nullable_float(row.get("portfolio_return_pct")),
+                            json.dumps(row, ensure_ascii=False),
+                        ),
+                    )
+        return None
+
+
+def make_state_store():
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if database_url:
+        try:
+            return PostgresStateStore(database_url), ""
+        except Exception as exc:
+            return LocalStateStore(), f"Postgres disabled, using local JSON: {exc}"
+    return LocalStateStore(), ""
 
 
 def summarize_ledger(ledger):
@@ -132,29 +292,17 @@ class PaperTradeApp:
         self.running = not args.no_autostart
         self.in_cycle = False
         self.stop_event = threading.Event()
-        self.state = load_json(
-            STATE_PATH,
-            {
-                "created_at": utc_now(),
-                "updated_at": utc_now(),
-                "mode": "paper_only",
-                "market": args.market,
-                "modules": list(args.modules),
-                "interval_sec": args.interval_sec,
-                "last_run_at": "",
-                "last_error": "",
-                "last_cycle": {},
-                "ledger_summary": {},
-                "ledger": [],
-                "seen_trade_keys": [],
-            },
-        )
+        self.store, storage_error = make_state_store()
+        self.state = self.store.load(default_state(args))
         self.state["mode"] = "paper_only"
         self.state["market"] = args.market
         self.state["modules"] = list(args.modules)
         self.state["interval_sec"] = args.interval_sec
         self.state["monitor_enabled"] = not args.skip_monitor
+        self.state["storage_backend"] = self.store.backend
+        self.state["storage_error"] = storage_error
         self.worker = threading.Thread(target=self.worker_loop, name="paper-trade-loop", daemon=True)
+        self.save_state()
 
     def start(self):
         self.worker.start()
@@ -170,7 +318,21 @@ class PaperTradeApp:
         with self.lock:
             self.running = value
             self.state["updated_at"] = utc_now()
+            self.save_state()
+
+    def save_state(self):
+        self.state["storage_backend"] = self.store.backend
+        try:
+            self.store.save(self.state)
+        except Exception as exc:
+            self.state["storage_error"] = f"State save failed, local JSON fallback used: {exc}"
             save_json(STATE_PATH, self.state)
+
+    def record_trades(self, rows):
+        try:
+            self.store.record_trades(rows)
+        except Exception as exc:
+            self.state["storage_error"] = f"Trade archive save failed: {exc}"
 
     def run_subprocess(self, command):
         started = time.time()
@@ -196,7 +358,7 @@ class PaperTradeApp:
                 return {"status": "already_running"}
             self.in_cycle = True
             self.state["last_error"] = ""
-            save_json(STATE_PATH, self.state)
+            self.save_state()
 
         stamp = compact_timestamp()
         journal_rel = f"data/paper_live/journal_{stamp}.csv"
@@ -312,7 +474,8 @@ class PaperTradeApp:
                 cycle["new_trades"] = len(new_rows)
                 cycle["finished_at"] = utc_now()
                 self.state["last_cycle"] = cycle
-                save_json(STATE_PATH, self.state)
+                self.record_trades(new_rows)
+                self.save_state()
             return {"status": "ok", "new_trades": cycle["new_trades"]}
         except Exception as exc:
             with self.lock:
@@ -321,7 +484,7 @@ class PaperTradeApp:
                 self.state["last_error"] = cycle["error"]
                 self.state["last_cycle"] = cycle
                 self.state["updated_at"] = utc_now()
-                save_json(STATE_PATH, self.state)
+                self.save_state()
             return {"status": "error", "error": str(exc)}
         finally:
             with self.lock:
@@ -426,6 +589,7 @@ def render_dashboard(state):
     status = "RUNNING" if state.get("running") else "STOPPED"
     in_cycle = "yes" if state.get("in_cycle") else "no"
     last_error = state.get("last_error") or ""
+    storage_error = state.get("storage_error") or ""
     style = """
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 32px; background: #0f1419; color: #e6edf3; }
     h1, h2 { margin-bottom: 8px; }
@@ -470,6 +634,7 @@ def render_dashboard(state):
     <div class="card"><strong>Market</strong><br>{html.escape(str(state.get('market', '')))}</div>
     <div class="card"><strong>Modules</strong><br>{html.escape(', '.join(state.get('modules', [])))}</div>
     <div class="card"><strong>Last Run</strong><br>{html.escape(str(state.get('last_run_at', '')))}</div>
+    <div class="card"><strong>Storage</strong><br>{html.escape(str(state.get('storage_backend', 'local_json')))}</div>
     <div class="card"><strong>Ledger Return</strong><br>{html.escape(str(ledger_summary.get('portfolio_return_sum_pct', 0.0)))}%</div>
     <div class="card"><strong>Accepted Trades</strong><br>{html.escape(str(ledger_summary.get('accepted_trades', 0)))}</div>
     <div class="card"><strong>Win Rate</strong><br>{html.escape(str(ledger_summary.get('win_rate_pct', 0.0)))}%</div>
@@ -482,6 +647,8 @@ def render_dashboard(state):
   {render_table(summary, ['asset', 'strategy', 'signals', 'filled', 'accepted', 'fill_rate_pct', 'accepted_return_sum_pct', 'accepted_profit_factor'], 30)}
   <h2>Last Error</h2>
   <pre>{html.escape(last_error) if last_error else 'None'}</pre>
+  <h2>Storage Error</h2>
+  <pre>{html.escape(storage_error) if storage_error else 'None'}</pre>
 </body>
 </html>"""
 
