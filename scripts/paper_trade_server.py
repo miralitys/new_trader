@@ -153,6 +153,7 @@ class PaperTradeApp:
         self.state["market"] = args.market
         self.state["modules"] = list(args.modules)
         self.state["interval_sec"] = args.interval_sec
+        self.state["monitor_enabled"] = not args.skip_monitor
         self.worker = threading.Thread(target=self.worker_loop, name="paper-trade-loop", daemon=True)
 
     def start(self):
@@ -240,11 +241,17 @@ class PaperTradeApp:
             universe_rel,
             "--paper-summary",
             summary_rel,
+            "--days",
+            str(self.args.monitor_days),
+            "--stress-window",
+            str(self.args.monitor_stress_window),
             "--save",
             monitor_rel,
             "--save-report",
             monitor_report_rel,
         ]
+        if self.args.monitor_skip_stress:
+            monitor_cmd.append("--skip-stress")
 
         cycle = {
             "started_at": utc_now(),
@@ -265,13 +272,14 @@ class PaperTradeApp:
             if cycle["journal"]["returncode"] != 0:
                 raise RuntimeError(cycle["journal"]["output"])
 
-            cycle["monitor"] = self.run_subprocess(monitor_cmd)
-            if cycle["monitor"]["returncode"] != 0:
-                raise RuntimeError(cycle["monitor"]["output"])
+            if not self.args.skip_monitor:
+                cycle["monitor"] = self.run_subprocess(monitor_cmd)
+                if cycle["monitor"]["returncode"] != 0:
+                    raise RuntimeError(cycle["monitor"]["output"])
 
             journal_rows = read_csv(ROOT / journal_rel)
             summary_rows = read_csv(ROOT / summary_rel)
-            monitor_rows = read_csv(ROOT / monitor_rel)
+            monitor_rows = read_csv(ROOT / monitor_rel) if not self.args.skip_monitor else []
             filled = [
                 row
                 for row in journal_rows
@@ -493,6 +501,10 @@ def parse_args():
     parser.add_argument("--fee-pct", type=float, default=0.0002)
     parser.add_argument("--slippage-pct", type=float, default=0.0)
     parser.add_argument("--no-autostart", action="store_true")
+    parser.add_argument("--skip-monitor", action="store_true")
+    parser.add_argument("--monitor-days", type=int, default=7)
+    parser.add_argument("--monitor-stress-window", type=int, default=7)
+    parser.add_argument("--monitor-skip-stress", action="store_true")
     return parser.parse_args()
 
 
