@@ -1087,16 +1087,25 @@ def render_dashboard(state, status_filter="ALL"):
     best_now_rows = sorted_best_now_rows(strategy_board)
     filtered_strategy_board = filter_strategy_rows(strategy_board, status_filter)
     ledger_summary = state.get("ledger_summary", {})
-    status = "RUNNING" if state.get("running") else "STOPPED"
     in_cycle = "yes" if state.get("in_cycle") else "no"
     last_error = state.get("last_error") or ""
     storage_error = state.get("storage_error") or ""
     last_run = display_time(state.get("last_run_at")) if state.get("last_run_at") else "not yet"
     modules = state.get("modules", [])
     modules_html = "".join(render_badge(module, "secondary") for module in modules)
+    stopped_alert_html = ""
+    if not state.get("running"):
+        stopped_alert_html = f"""
+      <section class="status-alert">
+        <div>
+          <div class="status-alert-title">Монитор остановлен</div>
+          <p>Paper-проверка сейчас не выполняется. Последний запуск: {html.escape(str(last_run))}.</p>
+        </div>
+        <button class="primary" onclick="post('/api/start')">Запустить</button>
+      </section>
+"""
     metrics_html = "\n".join(
         [
-            render_metric("Status", status, tone_class(status), "server loop"),
             render_metric("In cycle", in_cycle, tone_class(in_cycle), "current run"),
             render_metric("Storage", state.get("storage_backend", "local_json"), tone_class(state.get("storage_backend")), "persistence"),
             render_metric("Auth", "enabled" if state.get("auth_enabled") else "disabled", tone_class("enabled" if state.get("auth_enabled") else "disabled"), "access"),
@@ -1175,6 +1184,23 @@ def render_dashboard(state, status_filter="ALL"):
     button.destructive { background: var(--destructive); color: var(--destructive-foreground); border-color: var(--destructive); }
     button.secondary, .button-link { background: var(--secondary); color: var(--secondary-foreground); }
     button:hover, .button-link:hover { opacity: 0.9; }
+    .status-alert {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 18px;
+      border: 1px solid rgb(248 113 113 / 0.38);
+      border-radius: 8px;
+      background: rgb(248 113 113 / 0.12);
+      padding: 16px;
+    }
+    .status-alert-title {
+      margin-bottom: 4px;
+      color: hsl(0 93.5% 81.8%);
+      font-size: 18px;
+      font-weight: 750;
+    }
     .section { padding: 22px 0; border-bottom: 1px solid var(--border); }
     .section-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
     .section-copy { color: var(--muted-foreground); font-size: 13px; }
@@ -1300,7 +1326,7 @@ def render_dashboard(state, status_filter="ALL"):
     }
     @media (max-width: 760px) {
       .shell { padding: 16px; }
-      .topbar, .section-header { align-items: stretch; flex-direction: column; }
+      .topbar, .status-alert, .section-header { align-items: stretch; flex-direction: column; }
       .actions { justify-content: flex-start; }
       h1 { font-size: 26px; }
     }
@@ -1338,6 +1364,7 @@ def render_dashboard(state, status_filter="ALL"):
           <a class="button-link" href="/api/state">JSON</a>
         </div>
       </header>
+      {stopped_alert_html}
 
       <section class="section">
         <div class="section-header">
