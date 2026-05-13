@@ -1087,7 +1087,6 @@ def render_dashboard(state, status_filter="ALL"):
     best_now_rows = sorted_best_now_rows(strategy_board)
     filtered_strategy_board = filter_strategy_rows(strategy_board, status_filter)
     ledger_summary = state.get("ledger_summary", {})
-    in_cycle = "yes" if state.get("in_cycle") else "no"
     last_error = state.get("last_error") or ""
     storage_error = state.get("storage_error") or ""
     last_run = display_time(state.get("last_run_at")) if state.get("last_run_at") else "not yet"
@@ -1104,9 +1103,21 @@ def render_dashboard(state, status_filter="ALL"):
         <button class="primary" onclick="post('/api/start')">Запустить</button>
       </section>
 """
+    cycle_alert_html = ""
+    if state.get("in_cycle"):
+        cycle_alert_html = """
+      <section class="cycle-alert">
+        <div>
+          <div class="cycle-alert-title">Идет обновление данных</div>
+          <p>Сервер сейчас проверяет стратегии. Таблицы обновятся после завершения цикла.</p>
+        </div>
+      </section>
+"""
     metrics_html = "\n".join(
         [
-            render_metric("In cycle", in_cycle, tone_class(in_cycle), "current run"),
+            render_metric("TRADE", status_counts.get("TRADE", 0), "success", "можно рассматривать"),
+            render_metric("WATCH", status_counts.get("WATCH", 0), "warning", "наблюдаем"),
+            render_metric("OFF", status_counts.get("OFF", 0), "danger", "выключено"),
             render_metric("Ledger return", f"{ledger_summary.get('portfolio_return_sum_pct', 0.0)}%", None, "paper ledger"),
             render_metric("Accepted trades", ledger_summary.get("accepted_trades", 0), None, "deduplicated"),
             render_metric("Win rate", f"{ledger_summary.get('win_rate_pct', 0.0)}%", None, "accepted trades"),
@@ -1197,6 +1208,23 @@ def render_dashboard(state, status_filter="ALL"):
       margin-bottom: 4px;
       color: hsl(0 93.5% 81.8%);
       font-size: 18px;
+      font-weight: 750;
+    }
+    .cycle-alert {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 18px;
+      border: 1px solid rgb(250 204 21 / 0.28);
+      border-radius: 8px;
+      background: rgb(250 204 21 / 0.08);
+      padding: 14px 16px;
+    }
+    .cycle-alert-title {
+      margin-bottom: 4px;
+      color: hsl(47.9 95.8% 73.1%);
+      font-size: 16px;
       font-weight: 750;
     }
     .section { padding: 22px 0; border-bottom: 1px solid var(--border); }
@@ -1324,7 +1352,7 @@ def render_dashboard(state, status_filter="ALL"):
     }
     @media (max-width: 760px) {
       .shell { padding: 16px; }
-      .topbar, .status-alert, .section-header { align-items: stretch; flex-direction: column; }
+      .topbar, .status-alert, .cycle-alert, .section-header { align-items: stretch; flex-direction: column; }
       .actions { justify-content: flex-start; }
       h1 { font-size: 26px; }
     }
@@ -1363,6 +1391,7 @@ def render_dashboard(state, status_filter="ALL"):
         </div>
       </header>
       {stopped_alert_html}
+      {cycle_alert_html}
 
       <section class="section">
         <div class="section-header">
