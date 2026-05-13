@@ -75,6 +75,19 @@ def display_time(value):
     return parsed.astimezone(DISPLAY_TZ).strftime("%d.%m.%Y %H:%M:%S %Z")
 
 
+def display_time_minute(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(DISPLAY_TZ).strftime("%d.%m.%Y %H:%M %Z")
+
+
 def parse_datetime(value):
     text = str(value or "").strip()
     if not text:
@@ -163,12 +176,17 @@ def default_state(args):
         "mode": "paper_only",
         "market": args.market,
         "modules": list(args.modules),
+        "monitor_universe": getattr(args, "monitor_universe", "all"),
+        "monitor_every_cycles": getattr(args, "monitor_every_cycles", 15),
+        "monitor_strategy_count": 0,
         "interval_sec": args.interval_sec,
         "last_run_at": "",
+        "last_monitor_run_at": "",
         "last_error": "",
         "storage_backend": "local_json",
         "storage_error": "",
         "last_cycle": {},
+        "auto_cycle_count": 0,
         "ledger_summary": {},
         "ledger": [],
         "seen_trade_keys": [],
@@ -567,11 +585,15 @@ class PaperTradeApp:
                 self.state["ledger"] = ledger
                 self.state["ledger_summary"] = summarize_ledger(ledger)
                 self.state["latest_summary"] = summary_rows
+                now = utc_now()
                 self.state["latest_monitor"] = monitor_rows
-                self.state["last_run_at"] = utc_now()
-                self.state["updated_at"] = utc_now()
+                self.state["monitor_strategy_count"] = len(monitor_rows)
+                self.state["last_run_at"] = now
+                if run_monitor:
+                    self.state["last_monitor_run_at"] = now
+                self.state["updated_at"] = now
                 cycle["new_trades"] = len(new_rows)
-                cycle["finished_at"] = utc_now()
+                cycle["finished_at"] = now
                 self.state["last_cycle"] = cycle
                 self.record_trades(new_rows)
                 self.save_state()
@@ -875,10 +897,11 @@ def render_table(rows, columns, limit=20, class_name=""):
 
 def render_metric(label, value, tone=None, detail=""):
     badge = render_badge(value, tone) if tone else html.escape(str(value))
+    value_class = "metric-value compact" if len(str(value)) > 18 else "metric-value"
     detail_html = f'<div class="metric-detail">{html.escape(str(detail))}</div>' if detail else ""
     return f"""<section class="metric-card">
       <div class="metric-label">{html.escape(label)}</div>
-      <div class="metric-value">{badge}</div>
+      <div class="{value_class}">{badge}</div>
       {detail_html}
     </section>"""
 
@@ -1493,6 +1516,11 @@ def render_dashboard(state, status_filter="ALL"):
     last_run = display_time(state.get("last_run_at")) if state.get("last_run_at") else "not yet"
     modules = state.get("modules", [])
     modules_html = "".join(render_badge(module, "secondary") for module in modules)
+    monitor_count = int(state.get("monitor_strategy_count") or len(strategy_board))
+    paper_module_count = len(modules)
+    monitor_every = max(1, int(state.get("monitor_every_cycles") or 1))
+    last_monitor_raw = state.get("last_monitor_run_at") or (state.get("last_run_at") if monitor else "")
+    last_monitor_run = display_time_minute(last_monitor_raw) if last_monitor_raw else "ещё не было"
     stopped_alert_html = ""
     if not state.get("running"):
         stopped_alert_html = f"""
@@ -1516,6 +1544,9 @@ def render_dashboard(state, status_filter="ALL"):
 """
     metrics_html = "\n".join(
         [
+            render_metric("Стратегий в мониторинге", monitor_count, None, "полный список"),
+            render_metric("Paper-модулей", paper_module_count, None, "реально исполняются"),
+            render_metric("Полный монитор", last_monitor_run, None, f"раз в {monitor_every} циклов"),
             render_metric("TRADE", status_counts.get("TRADE", 0), "success", "можно рассматривать"),
             render_metric("WATCH", status_counts.get("WATCH", 0), "warning", "наблюдаем"),
             render_metric("OFF", status_counts.get("OFF", 0), "danger", "выключено"),
@@ -1677,6 +1708,7 @@ def render_dashboard(state, status_filter="ALL"):
     }
     .metric-label { color: var(--muted-foreground); font-size: 12px; font-weight: 600; text-transform: uppercase; }
     .metric-value { font-size: 24px; line-height: 1; font-weight: 700; word-break: break-word; }
+    .metric-value.compact { font-size: 18px; line-height: 1.25; }
     .metric-detail { color: var(--muted-foreground); font-size: 12px; }
     .ledger-metrics { margin-bottom: 12px; }
     .chart-card {
