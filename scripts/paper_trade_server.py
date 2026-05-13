@@ -669,28 +669,135 @@ def make_handler(app):
     return Handler
 
 
+def tone_class(value):
+    text = str(value or "").strip().lower()
+    if text in {"trade", "running", "yes", "filled", "accepted", "ok", "postgres", "enabled"}:
+        return "success"
+    if text in {"watch", "already_running"}:
+        return "warning"
+    if text in {"off", "stopped", "no", "error", "rejected", "local_json", "disabled"}:
+        return "danger"
+    return "secondary"
+
+
+def numeric_tone(value):
+    parsed = nullable_float(value)
+    if parsed is None or parsed == 0:
+        return "muted-value"
+    return "positive" if parsed > 0 else "negative"
+
+
+def render_badge(value, tone=None):
+    label = html.escape(str(value if value not in (None, "") else "none"))
+    badge_tone = tone or tone_class(value)
+    return f'<span class="badge {badge_tone}">{label}</span>'
+
+
+def render_cell(column, value):
+    if column in {"status", "direction", "order_status", "portfolio_status", "storage_backend"}:
+        return render_badge(value)
+    if column in {
+        "paper_return_sum_pct",
+        "accepted_return_sum_pct",
+        "net_return_pct",
+        "portfolio_return_pct",
+        "accepted_profit_factor",
+        "paper_profit_factor",
+        "fill_rate_pct",
+    }:
+        return f'<span class="{numeric_tone(value)}">{html.escape(str(value if value not in (None, "") else "0"))}</span>'
+    if column == "reason":
+        return f'<span class="reason">{html.escape(str(value or ""))}</span>'
+    return html.escape(str(value if value is not None else ""))
+
+
 def render_table(rows, columns, limit=20):
     rows = rows[:limit]
     if not rows:
-        return "<p>No rows yet.</p>"
+        return '<div class="empty-state">No rows yet.</div>'
     header = "".join(f"<th>{html.escape(col)}</th>" for col in columns)
     body_rows = []
     for row in rows:
-        cells = "".join(f"<td>{html.escape(str(row.get(col, '')))}</td>" for col in columns)
+        cells = "".join(f"<td>{render_cell(col, row.get(col, ''))}</td>" for col in columns)
         body_rows.append(f"<tr>{cells}</tr>")
-    return f"<table><thead><tr>{header}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+    return f'<div class="table-shell"><table><thead><tr>{header}</tr></thead><tbody>{"".join(body_rows)}</tbody></table></div>'
+
+
+def render_metric(label, value, tone=None, detail=""):
+    badge = render_badge(value, tone) if tone else html.escape(str(value))
+    detail_html = f'<div class="metric-detail">{html.escape(str(detail))}</div>' if detail else ""
+    return f"""<section class="metric-card">
+      <div class="metric-label">{html.escape(label)}</div>
+      <div class="metric-value">{badge}</div>
+      {detail_html}
+    </section>"""
 
 
 def render_login(error=""):
     style = """
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; min-height: 100vh; background: #0f1419; color: #e6edf3; display: grid; place-items: center; }
-    main { width: min(420px, calc(100vw - 32px)); background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 24px; }
-    h1 { margin: 0 0 8px; font-size: 28px; }
-    p { color: #8b949e; margin: 0 0 18px; }
-    label { display: block; font-weight: 700; margin-bottom: 8px; }
-    input { box-sizing: border-box; width: 100%; background: #0f1419; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 11px 12px; font-size: 16px; }
-    button { width: 100%; margin-top: 14px; background: #238636; color: white; border: 0; padding: 11px 12px; border-radius: 6px; font-size: 16px; cursor: pointer; }
-    .error { color: #ff7b72; margin-top: 12px; }
+    :root {
+      --background: hsl(222.2 84% 4.9%);
+      --foreground: hsl(210 40% 98%);
+      --card: hsl(222.2 84% 4.9%);
+      --card-foreground: hsl(210 40% 98%);
+      --muted: hsl(217.2 32.6% 17.5%);
+      --muted-foreground: hsl(215 20.2% 65.1%);
+      --border: hsl(217.2 32.6% 17.5%);
+      --input: hsl(217.2 32.6% 17.5%);
+      --primary: hsl(210 40% 98%);
+      --primary-foreground: hsl(222.2 47.4% 11.2%);
+      --destructive: hsl(0 62.8% 30.6%);
+      --ring: hsl(212.7 26.8% 83.9%);
+    }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100svh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      background: var(--background);
+      color: var(--foreground);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+    main {
+      width: min(420px, calc(100vw - 32px));
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--card);
+      box-shadow: 0 18px 60px rgb(0 0 0 / 0.35);
+    }
+    .login-header { padding: 24px 24px 0; }
+    .login-body { padding: 24px; }
+    .eyebrow { color: var(--muted-foreground); font-size: 12px; font-weight: 600; text-transform: uppercase; }
+    h1 { margin: 8px 0 8px; font-size: 26px; line-height: 1.1; font-weight: 700; }
+    p { margin: 0; color: var(--muted-foreground); line-height: 1.5; }
+    label { display: block; margin-bottom: 8px; font-size: 13px; font-weight: 600; }
+    input {
+      width: 100%;
+      height: 42px;
+      border: 1px solid var(--input);
+      border-radius: 6px;
+      background: transparent;
+      color: var(--foreground);
+      padding: 0 12px;
+      font-size: 14px;
+      outline: none;
+    }
+    input:focus { border-color: var(--ring); box-shadow: 0 0 0 3px rgb(148 163 184 / 0.2); }
+    button {
+      width: 100%;
+      height: 42px;
+      margin-top: 14px;
+      border: 0;
+      border-radius: 6px;
+      background: var(--primary);
+      color: var(--primary-foreground);
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .error { margin-top: 12px; color: hsl(0 84.2% 60.2%); font-size: 13px; }
     """
     error_html = f"<div class=\"error\">{html.escape(error)}</div>" if error else ""
     return f"""<!doctype html>
@@ -702,14 +809,19 @@ def render_login(error=""):
 </head>
 <body>
   <main>
-    <h1>Paper Trade Server</h1>
-    <p>Введите пароль для доступа к панели.</p>
-    <form method="post" action="/api/login">
-      <label for="password">Пароль</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" autofocus>
-      <button type="submit">Войти</button>
-    </form>
-    {error_html}
+    <div class="login-header">
+      <div class="eyebrow">Paper dashboard</div>
+      <h1>Вход в панель</h1>
+      <p>Доступ к live-монитору стратегий защищен паролем.</p>
+    </div>
+    <div class="login-body">
+      <form method="post" action="/api/login">
+        <label for="password">Пароль</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" autofocus>
+        <button type="submit">Войти</button>
+      </form>
+      {error_html}
+    </div>
   </main>
 </body>
 </html>"""
@@ -724,19 +836,164 @@ def render_dashboard(state):
     in_cycle = "yes" if state.get("in_cycle") else "no"
     last_error = state.get("last_error") or ""
     storage_error = state.get("storage_error") or ""
+    last_run = state.get("last_run_at") or "not yet"
+    modules = state.get("modules", [])
+    modules_html = "".join(render_badge(module, "secondary") for module in modules)
+    metrics_html = "\n".join(
+        [
+            render_metric("Status", status, tone_class(status), "server loop"),
+            render_metric("In cycle", in_cycle, tone_class(in_cycle), "current run"),
+            render_metric("Storage", state.get("storage_backend", "local_json"), tone_class(state.get("storage_backend")), "persistence"),
+            render_metric("Auth", "enabled" if state.get("auth_enabled") else "disabled", tone_class("enabled" if state.get("auth_enabled") else "disabled"), "access"),
+            render_metric("Ledger return", f"{ledger_summary.get('portfolio_return_sum_pct', 0.0)}%", None, "paper ledger"),
+            render_metric("Accepted trades", ledger_summary.get("accepted_trades", 0), None, "deduplicated"),
+            render_metric("Win rate", f"{ledger_summary.get('win_rate_pct', 0.0)}%", None, "accepted trades"),
+            render_metric("Latest summary", len(summary), None, "strategy rows"),
+        ]
+    )
     style = """
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 32px; background: #0f1419; color: #e6edf3; }
-    h1, h2 { margin-bottom: 8px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 18px 0; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }
-    .muted { color: #8b949e; }
-    button { background: #238636; color: white; border: 0; padding: 9px 12px; border-radius: 6px; margin-right: 8px; cursor: pointer; }
-    button.stop { background: #da3633; }
-    button.run { background: #1f6feb; }
-    table { border-collapse: collapse; width: 100%; font-size: 13px; margin: 12px 0 24px; }
-    th, td { border: 1px solid #30363d; padding: 6px 8px; text-align: left; }
-    th { background: #21262d; }
-    pre { white-space: pre-wrap; background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 8px; }
+    :root {
+      --background: hsl(222.2 84% 4.9%);
+      --foreground: hsl(210 40% 98%);
+      --card: hsl(222.2 84% 4.9%);
+      --card-foreground: hsl(210 40% 98%);
+      --muted: hsl(217.2 32.6% 17.5%);
+      --muted-foreground: hsl(215 20.2% 65.1%);
+      --popover: hsl(222.2 84% 4.9%);
+      --popover-foreground: hsl(210 40% 98%);
+      --primary: hsl(210 40% 98%);
+      --primary-foreground: hsl(222.2 47.4% 11.2%);
+      --secondary: hsl(217.2 32.6% 17.5%);
+      --secondary-foreground: hsl(210 40% 98%);
+      --destructive: hsl(0 62.8% 30.6%);
+      --destructive-foreground: hsl(210 40% 98%);
+      --border: hsl(217.2 32.6% 17.5%);
+      --input: hsl(217.2 32.6% 17.5%);
+      --ring: hsl(212.7 26.8% 83.9%);
+      --success: hsl(142.1 70.6% 45.3%);
+      --warning: hsl(47.9 95.8% 53.1%);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--background);
+      color: var(--foreground);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+    a { color: inherit; }
+    .shell { min-height: 100svh; padding: 24px; }
+    .workspace { max-width: 1440px; margin: 0 auto; }
+    .topbar {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .brand { display: grid; gap: 8px; }
+    .eyebrow { color: var(--muted-foreground); font-size: 12px; font-weight: 600; text-transform: uppercase; }
+    h1 { margin: 0; font-size: 30px; line-height: 1.15; font-weight: 700; }
+    h2 { margin: 0; font-size: 18px; line-height: 1.2; font-weight: 650; }
+    p { margin: 0; color: var(--muted-foreground); line-height: 1.5; }
+    .actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+    button, .button-link {
+      height: 36px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      padding: 0 12px;
+      background: transparent;
+      color: var(--foreground);
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    button.primary { background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }
+    button.destructive { background: var(--destructive); color: var(--destructive-foreground); border-color: var(--destructive); }
+    button.secondary, .button-link { background: var(--secondary); color: var(--secondary-foreground); }
+    button:hover, .button-link:hover { opacity: 0.9; }
+    .section { padding: 22px 0; border-bottom: 1px solid var(--border); }
+    .section-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+    .section-copy { color: var(--muted-foreground); font-size: 13px; }
+    .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+    .metric-card {
+      min-height: 112px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--card);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .metric-label { color: var(--muted-foreground); font-size: 12px; font-weight: 600; text-transform: uppercase; }
+    .metric-value { font-size: 24px; line-height: 1; font-weight: 700; word-break: break-word; }
+    .metric-detail { color: var(--muted-foreground); font-size: 12px; }
+    .module-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .badge.success { border-color: rgb(34 197 94 / 0.35); background: rgb(34 197 94 / 0.12); color: hsl(142.1 76.2% 73.1%); }
+    .badge.warning { border-color: rgb(250 204 21 / 0.35); background: rgb(250 204 21 / 0.12); color: hsl(47.9 95.8% 73.1%); }
+    .badge.danger { border-color: rgb(248 113 113 / 0.35); background: rgb(248 113 113 / 0.12); color: hsl(0 93.5% 81.8%); }
+    .badge.secondary { background: var(--secondary); color: var(--secondary-foreground); }
+    .table-shell {
+      width: 100%;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--card);
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { height: 42px; padding: 10px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }
+    th { color: var(--muted-foreground); font-size: 12px; font-weight: 650; text-transform: uppercase; background: var(--muted); }
+    tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: rgb(148 163 184 / 0.06); }
+    .empty-state {
+      min-height: 96px;
+      display: grid;
+      place-items: center;
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      color: var(--muted-foreground);
+      background: rgb(148 163 184 / 0.03);
+    }
+    .reason { color: var(--muted-foreground); }
+    .positive { color: hsl(142.1 76.2% 73.1%); font-weight: 650; }
+    .negative { color: hsl(0 93.5% 81.8%); font-weight: 650; }
+    .muted-value { color: var(--muted-foreground); }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--card);
+      color: var(--muted-foreground);
+      padding: 14px;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    @media (max-width: 760px) {
+      .shell { padding: 16px; }
+      .topbar, .section-header { align-items: stretch; flex-direction: column; }
+      .actions { justify-content: flex-start; }
+      h1 { font-size: 26px; }
+    }
     """
     script = """
     async function post(path) {
@@ -749,42 +1006,92 @@ def render_dashboard(state):
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Paper Trade Server</title>
   <style>{style}</style>
   <script>{script}</script>
 </head>
 <body>
-  <h1>Paper Trade Server</h1>
-  <p class="muted">Paper-only local monitor. No exchange orders. No API keys.</p>
-  <p>
-    <button onclick="post('/api/start')">Start</button>
-    <button class="stop" onclick="post('/api/stop')">Stop</button>
-    <button class="run" onclick="post('/api/run-once')">Run Once</button>
-    <form method="post" action="/api/logout" style="display:inline"><button class="stop" type="submit">Logout</button></form>
-    <a class="muted" href="/api/state">JSON state</a>
-  </p>
-  <div class="grid">
-    <div class="card"><strong>Status</strong><br>{html.escape(status)}</div>
-    <div class="card"><strong>In Cycle</strong><br>{html.escape(in_cycle)}</div>
-    <div class="card"><strong>Market</strong><br>{html.escape(str(state.get('market', '')))}</div>
-    <div class="card"><strong>Modules</strong><br>{html.escape(', '.join(state.get('modules', [])))}</div>
-    <div class="card"><strong>Last Run</strong><br>{html.escape(str(state.get('last_run_at', '')))}</div>
-    <div class="card"><strong>Storage</strong><br>{html.escape(str(state.get('storage_backend', 'local_json')))}</div>
-    <div class="card"><strong>Auth</strong><br>{'enabled' if state.get('auth_enabled') else 'disabled'}</div>
-    <div class="card"><strong>Ledger Return</strong><br>{html.escape(str(ledger_summary.get('portfolio_return_sum_pct', 0.0)))}%</div>
-    <div class="card"><strong>Accepted Trades</strong><br>{html.escape(str(ledger_summary.get('accepted_trades', 0)))}</div>
-    <div class="card"><strong>Win Rate</strong><br>{html.escape(str(ledger_summary.get('win_rate_pct', 0.0)))}%</div>
-  </div>
-  <h2>Latest Accepted Paper Trades</h2>
-  {render_table(ledger, ['recorded_at', 'asset', 'symbol', 'strategy', 'module', 'direction', 'entry', 'exit', 'reason', 'net_return_pct', 'portfolio_return_pct'], 30)}
-  <h2>Latest Monitor</h2>
-  {render_table(monitor, ['symbol', 'asset', 'strategy', 'status', 'paper_return_sum_pct', 'paper_profit_factor', 'reason'], 30)}
-  <h2>Latest Summary</h2>
-  {render_table(summary, ['asset', 'strategy', 'signals', 'filled', 'accepted', 'fill_rate_pct', 'accepted_return_sum_pct', 'accepted_profit_factor'], 30)}
-  <h2>Last Error</h2>
-  <pre>{html.escape(last_error) if last_error else 'None'}</pre>
-  <h2>Storage Error</h2>
-  <pre>{html.escape(storage_error) if storage_error else 'None'}</pre>
+  <main class="shell">
+    <div class="workspace">
+      <header class="topbar">
+        <div class="brand">
+          <div class="eyebrow">Paper trade server</div>
+          <h1>Live strategy monitor</h1>
+          <p>Paper-only монитор. Биржевые ордера и API-ключи не используются.</p>
+        </div>
+        <div class="actions">
+          <button class="primary" onclick="post('/api/start')">Start</button>
+          <button class="destructive" onclick="post('/api/stop')">Stop</button>
+          <button class="secondary" onclick="post('/api/run-once')">Run Once</button>
+          <form method="post" action="/api/logout" style="display:inline"><button class="secondary" type="submit">Logout</button></form>
+          <a class="button-link" href="/api/state">JSON</a>
+        </div>
+      </header>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Overview</h2>
+            <p class="section-copy">Market: {html.escape(str(state.get('market', '')))}. Last run: {html.escape(str(last_run))}.</p>
+          </div>
+          <div class="module-row">{modules_html}</div>
+        </div>
+        <div class="metrics-grid">
+          {metrics_html}
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Latest accepted paper trades</h2>
+            <p class="section-copy">Последние зачтенные paper-сделки из общего ledger.</p>
+          </div>
+        </div>
+        {render_table(ledger, ['recorded_at', 'asset', 'symbol', 'strategy', 'module', 'direction', 'entry', 'exit', 'reason', 'net_return_pct', 'portfolio_return_pct'], 30)}
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Latest monitor</h2>
+            <p class="section-copy">Операционный статус стратегий после последнего цикла.</p>
+          </div>
+        </div>
+        {render_table(monitor, ['symbol', 'asset', 'strategy', 'status', 'paper_return_sum_pct', 'paper_profit_factor', 'reason'], 30)}
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Latest summary</h2>
+            <p class="section-copy">Сигналы, исполнения и принятые сделки по модулям.</p>
+          </div>
+        </div>
+        {render_table(summary, ['asset', 'strategy', 'signals', 'filled', 'accepted', 'fill_rate_pct', 'accepted_return_sum_pct', 'accepted_profit_factor'], 30)}
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Diagnostics</h2>
+            <p class="section-copy">Ошибки последнего цикла и состояния хранилища.</p>
+          </div>
+        </div>
+        <div class="metrics-grid">
+          <div>
+            <h2>Last error</h2>
+            <pre>{html.escape(last_error) if last_error else 'None'}</pre>
+          </div>
+          <div>
+            <h2>Storage error</h2>
+            <pre>{html.escape(storage_error) if storage_error else 'None'}</pre>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
 </body>
 </html>"""
 
