@@ -332,15 +332,22 @@ def summarize_ledger(ledger):
     }
 
 
-def write_module_universe(modules, path):
+def write_module_universe(modules, path, mode="all"):
     source_path = ROOT / "data" / "operational_monitor_universe_2026-05-04.csv"
     rows = read_csv(source_path)
-    wanted = set()
-    for module in modules:
-        wanted.update(MODULE_STRATEGIES.get(module, set()))
-    selected = [row for row in rows if row.get("strategy") in wanted]
-    if not selected:
+    if not rows:
+        raise RuntimeError(f"Monitor universe is empty or missing: {source_path}")
+
+    if mode == "all":
         selected = rows
+    else:
+        wanted = set()
+        for module in modules:
+            wanted.update(MODULE_STRATEGIES.get(module, set()))
+        selected = [row for row in rows if row.get("strategy") in wanted]
+        if not selected:
+            selected = rows
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
@@ -362,6 +369,7 @@ class PaperTradeApp:
         self.state["mode"] = "paper_only"
         self.state["market"] = args.market
         self.state["modules"] = list(args.modules)
+        self.state["monitor_universe"] = args.monitor_universe
         self.state["interval_sec"] = args.interval_sec
         self.state["monitor_enabled"] = not args.skip_monitor
         self.state["storage_backend"] = self.store.backend
@@ -496,7 +504,7 @@ class PaperTradeApp:
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             LOG_DIR.mkdir(parents=True, exist_ok=True)
-            write_module_universe(self.args.modules, ROOT / universe_rel)
+            write_module_universe(self.args.modules, ROOT / universe_rel, self.args.monitor_universe)
             cycle["journal"] = self.run_subprocess(journal_cmd)
             if cycle["journal"]["returncode"] != 0:
                 raise RuntimeError(cycle["journal"]["output"])
@@ -2048,6 +2056,12 @@ def parse_args():
     parser.add_argument("--slippage-pct", type=float, default=0.0)
     parser.add_argument("--no-autostart", action="store_true")
     parser.add_argument("--skip-monitor", action="store_true")
+    parser.add_argument(
+        "--monitor-universe",
+        choices=["all", "modules"],
+        default="all",
+        help="Use all fixed strategies in the operational monitor, or only the selected paper modules.",
+    )
     parser.add_argument("--monitor-days", type=int, default=7)
     parser.add_argument("--monitor-stress-window", type=int, default=7)
     parser.add_argument("--monitor-skip-stress", action="store_true")
