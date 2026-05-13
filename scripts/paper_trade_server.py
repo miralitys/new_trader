@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -72,6 +72,19 @@ def display_time(value):
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(DISPLAY_TZ).strftime("%d.%m.%Y %H:%M:%S %Z")
+
+
+def parse_datetime(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def is_time_column(column):
@@ -761,6 +774,7 @@ COLUMN_LABELS = {
     "exit": "Выход",
     "net_return_pct": "Сделка",
     "portfolio_return_pct": "Портфель",
+    "last_trade_time": "Последняя",
 }
 STATUS_FILTERS = ("ALL", "TRADE", "WATCH", "OFF")
 
@@ -796,6 +810,8 @@ def render_cell(column, value):
         tone = "negative" if parsed and parsed > 0 else "muted-value"
         return f'<span class="{tone}">{html.escape(format_decimal(value, 2, "%"))}</span>'
     if column in PF_COLUMNS:
+        if str(value).strip().lower() in {"inf", "infinity", "∞"}:
+            return '<span class="positive">∞</span>'
         parsed = nullable_float(value)
         if parsed is None or parsed == 0:
             tone = "muted-value"
@@ -931,6 +947,84 @@ def count_by_status(rows):
     return counts
 
 
+def trade_event_time(row):
+    for key in ("exit_time", "recorded_at", "fill_time", "order_start_time", "signal_time"):
+        parsed = parse_datetime(row.get(key))
+        if parsed:
+            return parsed
+    return None
+
+
+def recent_accepted_ledger_rows(ledger, hours=24):
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=hours)
+    rows = []
+    for row in ledger:
+        if row.get("portfolio_status") != "accepted":
+            continue
+        event_time = trade_event_time(row)
+        if not event_time or event_time < cutoff or event_time > now + timedelta(minutes=5):
+            continue
+        enriched = dict(row)
+        enriched["_event_time"] = event_time
+        rows.append(enriched)
+    return sorted(rows, key=lambda row: row["_event_time"])
+
+
+def profit_factor_from_returns(returns):
+    wins = sum(value for value in returns if value > 0)
+    losses = abs(sum(value for value in returns if value < 0))
+    if losses > 0:
+        return round(wins / losses, 4)
+    if wins > 0:
+        return "∞"
+    return 0.0
+
+
+def aggregate_ledger_by_strategy(rows, strategy_board):
+    lookup = {strategy_key(row): row for row in strategy_board}
+    buckets = {}
+    for row in rows:
+        key = strategy_key(row)
+        item = buckets.setdefault(
+            key,
+            {
+                "asset": row.get("asset") or key[0],
+                "symbol": row.get("symbol", ""),
+                "strategy": row.get("strategy", ""),
+                "side": row.get("direction", ""),
+                "status": lookup.get(key, {}).get("status", "PAPER"),
+                "accepted": 0,
+                "accepted_return_sum_pct": 0.0,
+                "accepted_profit_factor": 0.0,
+                "_returns": [],
+                "_last_time": "",
+            },
+        )
+        value = safe_float(row.get("portfolio_return_pct") or row.get("net_return_pct"))
+        item["accepted"] += 1
+        item["accepted_return_sum_pct"] += value
+        item["_returns"].append(value)
+        item["_last_time"] = row.get("exit_time") or row.get("recorded_at") or item["_last_time"]
+
+    result = []
+    for item in buckets.values():
+        returns = item.pop("_returns")
+        item["accepted_return_sum_pct"] = round(item["accepted_return_sum_pct"], 4)
+        item["accepted_profit_factor"] = profit_factor_from_returns(returns)
+        item["last_trade_time"] = item.pop("_last_time")
+        result.append(item)
+
+    return sorted(
+        result,
+        key=lambda row: (
+            safe_float(row.get("accepted_return_sum_pct")),
+            safe_float(row.get("accepted")),
+        ),
+        reverse=True,
+    )
+
+
 def sorted_today_rows(strategy_board):
     rows = [
         row
@@ -947,6 +1041,73 @@ def sorted_today_rows(strategy_board):
         ),
         reverse=True,
     )
+
+
+def render_pnl_chart(rows):
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    events = []
+    cumulative = 0.0
+    for row in sorted(rows, key=lambda item: item.get("_event_time") or cutoff):
+        event_time = row.get("_event_time") or trade_event_time(row)
+        if not event_time:
+            continue
+        cumulative += safe_float(row.get("portfolio_return_pct") or row.get("net_return_pct"))
+        events.append((event_time, cumulative))
+
+    if not events:
+        return '<div class="empty-state chart-empty">За последние 24 часа зачтенных paper-сделок нет.</div>'
+
+    width = 1000
+    height = 240
+    pad_x = 28
+    pad_y = 24
+    values = [0.0] + [value for _, value in events]
+    min_y = min(values)
+    max_y = max(values)
+    if min_y == max_y:
+        min_y -= 1.0
+        max_y += 1.0
+    padding = (max_y - min_y) * 0.12
+    min_y -= padding
+    max_y += padding
+    span_seconds = max((now - cutoff).total_seconds(), 1)
+
+    def x_pos(moment):
+        ratio = (moment - cutoff).total_seconds() / span_seconds
+        ratio = max(0.0, min(1.0, ratio))
+        return pad_x + ratio * (width - pad_x * 2)
+
+    def y_pos(value):
+        ratio = (value - min_y) / (max_y - min_y)
+        return height - pad_y - ratio * (height - pad_y * 2)
+
+    points = [(pad_x, y_pos(0.0))] + [(x_pos(moment), y_pos(value)) for moment, value in events]
+    point_attr = " ".join(f"{x:.2f},{y:.2f}" for x, y in points)
+    zero_y = y_pos(0.0)
+    area_points = f"{pad_x:.2f},{zero_y:.2f} {point_attr} {points[-1][0]:.2f},{zero_y:.2f}"
+    final_value = events[-1][1]
+    line_class = "positive-line" if final_value >= 0 else "negative-line"
+    area_class = "positive-area" if final_value >= 0 else "negative-area"
+    circles = "".join(
+        f'<circle cx="{x:.2f}" cy="{y:.2f}" r="4"></circle>'
+        for x, y in points[1:][-18:]
+    )
+    return f"""
+        <div class="chart-card">
+          <div class="chart-meta">
+            <span>Старт: {html.escape(display_time(cutoff.isoformat()))}</span>
+            <strong class="{numeric_tone(final_value)}">{html.escape(format_decimal(final_value, 2, "%"))}</strong>
+            <span>Сейчас: {html.escape(display_time(now.isoformat()))}</span>
+          </div>
+          <svg class="pnl-chart" viewBox="0 0 {width} {height}" role="img" aria-label="PnL за последние 24 часа">
+            <line class="zero-line" x1="{pad_x}" x2="{width - pad_x}" y1="{zero_y:.2f}" y2="{zero_y:.2f}"></line>
+            <polyline class="{area_class}" points="{area_points}"></polyline>
+            <polyline class="{line_class}" points="{point_attr}"></polyline>
+            <g class="{line_class}">{circles}</g>
+          </svg>
+        </div>
+    """
 
 
 def sorted_best_now_rows(strategy_board):
@@ -1087,19 +1248,22 @@ def render_login(error=""):
 
 
 def render_dashboard(state, status_filter="ALL"):
-    ledger = list(reversed(state.get("ledger", [])))
+    ledger_rows = state.get("ledger", [])
+    ledger = list(reversed(ledger_rows))
     monitor = state.get("latest_monitor", [])
     summary = state.get("latest_summary", [])
     strategy_board = build_strategy_board(summary, monitor)
     status_filter = normalize_status_filter(status_filter)
     status_counts = count_by_status(strategy_board)
-    today_rows = sorted_today_rows(strategy_board)
+    today_ledger_rows = recent_accepted_ledger_rows(ledger_rows, hours=24)
+    today_rows = aggregate_ledger_by_strategy(today_ledger_rows, strategy_board)
     best_now_rows = sorted_best_now_rows(strategy_board)
     filtered_strategy_board = filter_strategy_rows(strategy_board, status_filter)
     ledger_summary = state.get("ledger_summary", {})
-    today_pnl = sum(safe_float(row.get("accepted_return_sum_pct")) for row in today_rows)
-    today_trades = sum(int(safe_float(row.get("accepted"))) for row in today_rows)
+    today_pnl = sum(safe_float(row.get("portfolio_return_pct") or row.get("net_return_pct")) for row in today_ledger_rows)
+    today_trades = len(today_ledger_rows)
     best_today_value, best_today_detail = best_today_summary(today_rows)
+    pnl_chart_html = render_pnl_chart(today_ledger_rows)
     last_error = state.get("last_error") or ""
     storage_error = state.get("storage_error") or ""
     last_run = display_time(state.get("last_run_at")) if state.get("last_run_at") else "not yet"
@@ -1291,6 +1455,74 @@ def render_dashboard(state, status_filter="ALL"):
     .metric-value { font-size: 24px; line-height: 1; font-weight: 700; word-break: break-word; }
     .metric-detail { color: var(--muted-foreground); font-size: 12px; }
     .ledger-metrics { margin-bottom: 12px; }
+    .chart-card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--card);
+      padding: 14px;
+    }
+    .chart-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+      color: var(--muted-foreground);
+      font-size: 12px;
+    }
+    .chart-meta strong {
+      color: var(--foreground);
+      font-size: 22px;
+      line-height: 1;
+    }
+    .pnl-chart {
+      width: 100%;
+      height: 220px;
+      display: block;
+      overflow: visible;
+    }
+    .pnl-chart .zero-line {
+      stroke: rgb(148 163 184 / 0.22);
+      stroke-width: 2;
+      stroke-dasharray: 7 7;
+    }
+    .pnl-chart .positive-line,
+    .pnl-chart .negative-line {
+      fill: none;
+      stroke-width: 4;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .pnl-chart .positive-line {
+      color: hsl(142.1 76.2% 73.1%);
+      stroke: hsl(142.1 76.2% 73.1%);
+    }
+    .pnl-chart .negative-line {
+      color: hsl(0 93.5% 81.8%);
+      stroke: hsl(0 93.5% 81.8%);
+    }
+    .pnl-chart .positive-area,
+    .pnl-chart .negative-area {
+      stroke: none;
+      opacity: 0.14;
+    }
+    .pnl-chart .positive-area {
+      fill: hsl(142.1 76.2% 73.1%);
+    }
+    .pnl-chart .negative-area {
+      fill: hsl(0 93.5% 81.8%);
+    }
+    .pnl-chart circle {
+      fill: var(--background);
+      stroke: currentColor;
+      stroke-width: 3;
+    }
+    .chart-empty {
+      min-height: 180px;
+    }
+    .table-gap {
+      height: 12px;
+    }
     .module-row { display: flex; flex-wrap: wrap; gap: 6px; }
     .badge {
       display: inline-flex;
@@ -1414,6 +1646,7 @@ def render_dashboard(state, status_filter="ALL"):
       .actions { justify-content: flex-start; }
       h1 { font-size: 26px; }
       .diagnostics-grid { grid-template-columns: 1fr; }
+      .chart-meta { align-items: flex-start; flex-direction: column; }
     }
     """
     script = """
@@ -1469,10 +1702,12 @@ def render_dashboard(state, status_filter="ALL"):
         <div class="section-header">
           <div>
             <h2>Сегодня, 24 часа</h2>
-            <p class="section-copy">Сигналы, зачтенные paper-сделки и доходность текущего 24h paper-цикла.</p>
+            <p class="section-copy">Только реальные зачтенные paper-сделки из ledger, закрытые за последние 24 часа.</p>
           </div>
         </div>
-        {render_table(today_rows, ['asset', 'strategy', 'side', 'status', 'signals', 'accepted', 'accepted_return_sum_pct', 'accepted_profit_factor'], 20, 'today-board')}
+        {pnl_chart_html}
+        <div class="table-gap"></div>
+        {render_table(today_rows, ['asset', 'strategy', 'side', 'status', 'accepted', 'accepted_return_sum_pct', 'accepted_profit_factor', 'last_trade_time'], 20, 'today-board')}
       </section>
 
       <section class="section">
