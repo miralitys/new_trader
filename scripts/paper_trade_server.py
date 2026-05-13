@@ -1107,8 +1107,6 @@ def render_dashboard(state, status_filter="ALL"):
     metrics_html = "\n".join(
         [
             render_metric("In cycle", in_cycle, tone_class(in_cycle), "current run"),
-            render_metric("Storage", state.get("storage_backend", "local_json"), tone_class(state.get("storage_backend")), "persistence"),
-            render_metric("Auth", "enabled" if state.get("auth_enabled") else "disabled", tone_class("enabled" if state.get("auth_enabled") else "disabled"), "access"),
             render_metric("Ledger return", f"{ledger_summary.get('portfolio_return_sum_pct', 0.0)}%", None, "paper ledger"),
             render_metric("Accepted trades", ledger_summary.get("accepted_trades", 0), None, "deduplicated"),
             render_metric("Win rate", f"{ledger_summary.get('win_rate_pct', 0.0)}%", None, "accepted trades"),
@@ -1448,6 +1446,8 @@ def render_dashboard(state, status_filter="ALL"):
           </div>
         </div>
         <div class="metrics-grid">
+          {render_metric("Storage", state.get("storage_backend", "local_json"), tone_class(state.get("storage_backend")), "persistence")}
+          {render_metric("Auth", "enabled" if state.get("auth_enabled") else "disabled", tone_class("enabled" if state.get("auth_enabled") else "disabled"), "access")}
           <div>
             <h2>Last error</h2>
             <pre>{html.escape(last_error) if last_error else 'None'}</pre>
