@@ -694,19 +694,40 @@ def render_badge(value, tone=None):
 
 
 def render_cell(column, value):
-    if column in {"status", "direction", "order_status", "portfolio_status", "storage_backend"}:
+    if column in {"status", "side", "direction", "order_status", "portfolio_status", "storage_backend"}:
         return render_badge(value)
+    if column in {"dd_30d_pct", "dd_60d_pct", "strict_dd_30d_pct", "taker_dd_30d_pct"}:
+        parsed = nullable_float(value)
+        tone = "negative" if parsed and parsed > 0 else "muted-value"
+        return f'<span class="{tone}">{html.escape(str(value if value not in (None, "") else "0"))}</span>'
+    if column in {"accepted_profit_factor", "paper_profit_factor", "pf_30d", "pf_60d", "strict_pf_30d", "taker_pf_30d"}:
+        parsed = nullable_float(value)
+        if parsed is None or parsed == 0:
+            tone = "muted-value"
+        elif parsed >= 1:
+            tone = "positive"
+        else:
+            tone = "negative"
+        return f'<span class="{tone}">{html.escape(str(value if value not in (None, "") else "0"))}</span>'
     if column in {
         "paper_return_sum_pct",
         "accepted_return_sum_pct",
         "net_return_pct",
         "portfolio_return_pct",
-        "accepted_profit_factor",
-        "paper_profit_factor",
+        "return_30d_pct",
+        "return_60d_pct",
+        "strict_return_30d_pct",
+        "taker_return_30d_pct",
+        "accepted_expectancy_pct",
+        "paper_expectancy_pct",
+        "expectancy_30d_pct",
+        "expectancy_60d_pct",
+        "win_30d_pct",
+        "win_60d_pct",
         "fill_rate_pct",
     }:
         return f'<span class="{numeric_tone(value)}">{html.escape(str(value if value not in (None, "") else "0"))}</span>'
-    if column == "reason":
+    if column in {"reason", "stress_reason", "notes"}:
         return f'<span class="reason">{html.escape(str(value or ""))}</span>'
     return html.escape(str(value if value is not None else ""))
 
@@ -731,6 +752,90 @@ def render_metric(label, value, tone=None, detail=""):
       <div class="metric-value">{badge}</div>
       {detail_html}
     </section>"""
+
+
+def strategy_key(row):
+    return (
+        str(row.get("asset") or row.get("symbol") or "").strip(),
+        str(row.get("strategy") or "").strip(),
+    )
+
+
+def value_or_fallback(value, fallback=""):
+    return value if value not in (None, "") else fallback
+
+
+def build_strategy_board(summary_rows, monitor_rows):
+    board = {}
+
+    for row in monitor_rows:
+        key = strategy_key(row)
+        if not key[1]:
+            continue
+        board[key] = {
+            "asset": row.get("asset") or key[0],
+            "symbol": row.get("symbol", ""),
+            "strategy": row.get("strategy", ""),
+            "side": row.get("side", ""),
+            "status": row.get("status", ""),
+            "signals": row.get("paper_signals", ""),
+            "filled": row.get("paper_filled", ""),
+            "accepted": row.get("paper_accepted", ""),
+            "fill_rate_pct": row.get("paper_fill_rate_pct", ""),
+            "accepted_return_sum_pct": row.get("paper_return_sum_pct", ""),
+            "accepted_profit_factor": row.get("paper_profit_factor", ""),
+            "return_30d_pct": row.get("return_30d_pct", ""),
+            "pf_30d": row.get("pf_30d", ""),
+            "dd_30d_pct": row.get("dd_30d_pct", ""),
+            "trades_30d": row.get("trades_30d", ""),
+            "reason": row.get("reason", ""),
+        }
+
+    for row in summary_rows:
+        key = strategy_key(row)
+        if not key[1]:
+            continue
+        item = board.setdefault(
+            key,
+            {
+                "asset": row.get("asset") or key[0],
+                "symbol": row.get("symbol", ""),
+                "strategy": row.get("strategy", ""),
+                "side": row.get("direction", ""),
+                "status": "PAPER",
+                "signals": "",
+                "filled": "",
+                "accepted": "",
+                "fill_rate_pct": "",
+                "accepted_return_sum_pct": "",
+                "accepted_profit_factor": "",
+                "return_30d_pct": "",
+                "pf_30d": "",
+                "dd_30d_pct": "",
+                "trades_30d": "",
+                "reason": "",
+            },
+        )
+        item["signals"] = value_or_fallback(row.get("signals"), item.get("signals", ""))
+        item["filled"] = value_or_fallback(row.get("filled"), item.get("filled", ""))
+        item["accepted"] = value_or_fallback(row.get("accepted"), item.get("accepted", ""))
+        item["fill_rate_pct"] = value_or_fallback(row.get("fill_rate_pct"), item.get("fill_rate_pct", ""))
+        item["accepted_return_sum_pct"] = value_or_fallback(
+            row.get("accepted_return_sum_pct"), item.get("accepted_return_sum_pct", "")
+        )
+        item["accepted_profit_factor"] = value_or_fallback(
+            row.get("accepted_profit_factor"), item.get("accepted_profit_factor", "")
+        )
+
+    status_order = {"TRADE": 0, "WATCH": 1, "PAPER": 2, "OFF": 3, "ERROR": 4}
+    return sorted(
+        board.values(),
+        key=lambda row: (
+            status_order.get(str(row.get("status", "")).upper(), 5),
+            str(row.get("asset", "")),
+            str(row.get("strategy", "")),
+        ),
+    )
 
 
 def render_login(error=""):
@@ -831,6 +936,7 @@ def render_dashboard(state):
     ledger = list(reversed(state.get("ledger", [])))
     monitor = state.get("latest_monitor", [])
     summary = state.get("latest_summary", [])
+    strategy_board = build_strategy_board(summary, monitor)
     ledger_summary = state.get("ledger_summary", {})
     status = "RUNNING" if state.get("running") else "STOPPED"
     in_cycle = "yes" if state.get("in_cycle") else "no"
@@ -848,7 +954,7 @@ def render_dashboard(state):
             render_metric("Ledger return", f"{ledger_summary.get('portfolio_return_sum_pct', 0.0)}%", None, "paper ledger"),
             render_metric("Accepted trades", ledger_summary.get("accepted_trades", 0), None, "deduplicated"),
             render_metric("Win rate", f"{ledger_summary.get('win_rate_pct', 0.0)}%", None, "accepted trades"),
-            render_metric("Latest summary", len(summary), None, "strategy rows"),
+            render_metric("Strategy board", len(strategy_board), None, "tracked rows"),
         ]
     )
     style = """
@@ -1040,6 +1146,16 @@ def render_dashboard(state):
         <div class="metrics-grid">
           {metrics_html}
         </div>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Strategy board</h2>
+            <p class="section-copy">Главная сводка: текущий paper-цикл плюс 30d health по каждой стратегии.</p>
+          </div>
+        </div>
+        {render_table(strategy_board, ['asset', 'strategy', 'side', 'status', 'signals', 'filled', 'accepted', 'fill_rate_pct', 'accepted_return_sum_pct', 'accepted_profit_factor', 'return_30d_pct', 'pf_30d', 'dd_30d_pct', 'trades_30d', 'reason'], 50)}
       </section>
 
       <section class="section">
