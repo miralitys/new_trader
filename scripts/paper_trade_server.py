@@ -10,6 +10,7 @@ local dashboard/API for live observation.
 import argparse
 import csv
 import html
+import importlib
 import json
 import math
 import os
@@ -142,20 +143,31 @@ class PostgresStateStore:
     backend = "postgres"
 
     def __init__(self, database_url, state_id=STATE_ID):
-        try:
-            import psycopg
-
-            self.driver = "psycopg"
-            self.db_module = psycopg
-        except ImportError:
-            import psycopg2
-
-            self.driver = "psycopg2"
-            self.db_module = psycopg2
-
+        self.driver, self.db_module = self.import_driver()
         self.database_url = database_url
         self.state_id = state_id
         self.init_schema()
+
+    def import_driver(self):
+        try:
+            return "psycopg", importlib.import_module("psycopg")
+        except ImportError:
+            pass
+        try:
+            return "psycopg2", importlib.import_module("psycopg2")
+        except ImportError:
+            pass
+
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "psycopg2-binary>=2.9,<3"],
+            cwd=str(ROOT),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=True,
+            timeout=180,
+        )
+        return "psycopg2", importlib.import_module("psycopg2")
 
     def connect(self):
         if self.driver == "psycopg":
