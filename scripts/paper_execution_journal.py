@@ -509,8 +509,9 @@ def main():
     cf = load_module("cashflow_portfolio", CF_PATH)
     rif = load_module("rif_regime_monitor", RIF_PATH)
     global DYDX_TUNE, DYDX_PROTECTION
-    DYDX_TUNE = load_module("dydx_pullback_short_tune", DYDX_TUNE_PATH)
-    DYDX_PROTECTION = load_module("dydx_pullback_short_leverage_protection", DYDX_PROTECTION_PATH)
+    if "DYDX_X2" in args.modules:
+        DYDX_TUNE = load_module("dydx_pullback_short_tune", DYDX_TUNE_PATH)
+        DYDX_PROTECTION = load_module("dydx_pullback_short_leverage_protection", DYDX_PROTECTION_PATH)
 
     execution = {
         "entry_mode": args.entry_mode,

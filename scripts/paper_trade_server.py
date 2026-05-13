@@ -28,6 +28,15 @@ LOG_DIR = ROOT / "logs"
 STATE_PATH = DATA_DIR / "state.json"
 MAX_LEDGER_ROWS = 1000
 DEFAULT_MODULES = ("RIF", "GALA_10", "GALA_112", "ANKR", "SPELL", "DYDX_X2")
+MODULE_STRATEGIES = {
+    "ANKR": {"ANKR LONG Best"},
+    "RIF": {"RIF Regime Monitor"},
+    "GALA_73": {"Минутка 7.3"},
+    "GALA_10": {"Минутка 10"},
+    "GALA_112": {"Минутка 11.2"},
+    "SPELL": {"SPELL SHORT Best"},
+    "DYDX_X2": {"DYDX Pullback SHORT x2 Protected"},
+}
 
 
 def utc_now():
@@ -98,6 +107,22 @@ def summarize_ledger(ledger):
         "win_rate_pct": round((len(wins) / len(accepted) * 100.0), 2) if accepted else 0.0,
         "portfolio_return_sum_pct": round(total_return, 4),
     }
+
+
+def write_module_universe(modules, path):
+    source_path = ROOT / "data" / "operational_monitor_universe_2026-05-04.csv"
+    rows = read_csv(source_path)
+    wanted = set()
+    for module in modules:
+        wanted.update(MODULE_STRATEGIES.get(module, set()))
+    selected = [row for row in rows if row.get("strategy") in wanted]
+    if not selected:
+        selected = rows
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(selected)
 
 
 class PaperTradeApp:
@@ -178,6 +203,7 @@ class PaperTradeApp:
         report_rel = f"strategies/paper-live-journal-{stamp}.md"
         monitor_rel = f"data/paper_live/monitor_{stamp}.csv"
         monitor_report_rel = f"strategies/paper-live-monitor-{stamp}.md"
+        universe_rel = f"data/paper_live/universe_{stamp}.csv"
 
         journal_cmd = [
             sys.executable,
@@ -210,6 +236,8 @@ class PaperTradeApp:
         monitor_cmd = [
             sys.executable,
             "scripts/operational_daily_monitor.py",
+            "--universe",
+            universe_rel,
             "--paper-summary",
             summary_rel,
             "--save",
@@ -232,6 +260,7 @@ class PaperTradeApp:
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             LOG_DIR.mkdir(parents=True, exist_ok=True)
+            write_module_universe(self.args.modules, ROOT / universe_rel)
             cycle["journal"] = self.run_subprocess(journal_cmd)
             if cycle["journal"]["returncode"] != 0:
                 raise RuntimeError(cycle["journal"]["output"])

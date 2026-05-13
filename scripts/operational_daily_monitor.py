@@ -639,16 +639,18 @@ def main():
     parser.add_argument("--save-report", default=f"strategies/operational-daily-monitor-v2-{today}.md")
     args = parser.parse_args()
 
+    universe = read_csv(os.path.join(ROOT, args.universe))
+
     bt = load_module("gala_mb_backtest", BT_PATH)
     reinvest = load_module("reinvest_winning_strategies", REINVEST_PATH)
     multi = load_module("multi_coin_gala_strategy_check", MULTI_PATH)
     cf = load_module("cashflow_portfolio", CF_PATH)
     rif = load_module("rif_regime_monitor", RIF_PATH)
     global DYDX_TUNE, DYDX_PROTECTION
-    DYDX_TUNE = load_module("dydx_pullback_short_tune", DYDX_TUNE_PATH)
-    DYDX_PROTECTION = load_module("dydx_pullback_short_leverage_protection", DYDX_PROTECTION_PATH)
+    if any(source["strategy"] == "DYDX Pullback SHORT x2 Protected" for source in universe):
+        DYDX_TUNE = load_module("dydx_pullback_short_tune", DYDX_TUNE_PATH)
+        DYDX_PROTECTION = load_module("dydx_pullback_short_leverage_protection", DYDX_PROTECTION_PATH)
 
-    universe = read_csv(os.path.join(ROOT, args.universe))
     cache = {}
     rows = []
     produced = {}
