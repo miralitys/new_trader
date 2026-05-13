@@ -7,13 +7,13 @@ Paper-only crypto strategy monitor for Render.
 Build command:
 
 ```bash
-python3 -m pip install --upgrade pip && python3 -m pip install -r requirements.txt
+python3 -m venv .venv && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -r requirements.txt
 ```
 
 Start command:
 
 ```bash
-python3 -m pip install -r requirements.txt && python3 scripts/paper_trade_server.py --host 0.0.0.0 --port $PORT --interval-sec 120 --days 1 --warmup-days 10 --market data_api_spot --entry-mode maker_limit --modules ANKR RIF GALA_73 GALA_10 GALA_112 SPELL
+.venv/bin/python scripts/paper_trade_server.py --host 0.0.0.0 --port $PORT --interval-sec 120 --days 1 --warmup-days 10 --market data_api_spot --entry-mode maker_limit --modules ANKR RIF GALA_73 GALA_10 GALA_112 SPELL
 ```
 
 The service never sends exchange orders and does not need API keys. It only

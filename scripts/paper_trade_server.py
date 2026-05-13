@@ -156,18 +156,7 @@ class PostgresStateStore:
         try:
             return "psycopg2", importlib.import_module("psycopg2")
         except ImportError:
-            pass
-
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "psycopg2-binary>=2.9,<3"],
-            cwd=str(ROOT),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=True,
-            timeout=180,
-        )
-        return "psycopg2", importlib.import_module("psycopg2")
+            raise ImportError("No Postgres driver installed. Run pip install -r requirements.txt inside the app virtualenv.")
 
     def connect(self):
         if self.driver == "psycopg":
