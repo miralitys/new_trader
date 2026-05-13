@@ -935,7 +935,7 @@ def sorted_today_rows(strategy_board):
     rows = [
         row
         for row in strategy_board
-        if row.get("signals") not in (None, "") or row.get("accepted") not in (None, "")
+        if safe_float(row.get("signals")) > 0 or safe_float(row.get("accepted")) > 0
     ]
     return sorted(
         rows,
@@ -980,6 +980,16 @@ def render_status_filters(status_filter, counts):
             f'href="/?status={status}">{status}<span>{counts.get(status, 0)}</span></a>'
         )
     return f'<nav class="filter-row" aria-label="Strategy status filters">{"".join(links)}</nav>'
+
+
+def best_today_summary(today_rows):
+    if not today_rows:
+        return "нет", "сигналов не было"
+    best = today_rows[0]
+    asset = best.get("asset") or best.get("symbol") or "-"
+    strategy = best.get("strategy") or "-"
+    result = format_decimal(best.get("accepted_return_sum_pct"), 2, "%")
+    return str(asset), f"{strategy} / {result}"
 
 
 def render_login(error=""):
@@ -1087,6 +1097,9 @@ def render_dashboard(state, status_filter="ALL"):
     best_now_rows = sorted_best_now_rows(strategy_board)
     filtered_strategy_board = filter_strategy_rows(strategy_board, status_filter)
     ledger_summary = state.get("ledger_summary", {})
+    today_pnl = sum(safe_float(row.get("accepted_return_sum_pct")) for row in today_rows)
+    today_trades = sum(int(safe_float(row.get("accepted"))) for row in today_rows)
+    best_today_value, best_today_detail = best_today_summary(today_rows)
     last_error = state.get("last_error") or ""
     storage_error = state.get("storage_error") or ""
     last_run = display_time(state.get("last_run_at")) if state.get("last_run_at") else "not yet"
@@ -1118,12 +1131,16 @@ def render_dashboard(state, status_filter="ALL"):
             render_metric("TRADE", status_counts.get("TRADE", 0), "success", "можно рассматривать"),
             render_metric("WATCH", status_counts.get("WATCH", 0), "warning", "наблюдаем"),
             render_metric("OFF", status_counts.get("OFF", 0), "danger", "выключено"),
+            render_metric("Сегодня PnL", format_decimal(today_pnl, 2, "%"), None, "paper 24h"),
+            render_metric("Сегодня сделок", today_trades, None, "accepted"),
+            render_metric("Лучший сегодня", best_today_value, None, best_today_detail),
+        ]
+    )
+    ledger_metrics_html = "\n".join(
+        [
             render_metric("Ledger return", f"{ledger_summary.get('portfolio_return_sum_pct', 0.0)}%", None, "paper ledger"),
             render_metric("Accepted trades", ledger_summary.get("accepted_trades", 0), None, "deduplicated"),
             render_metric("Win rate", f"{ledger_summary.get('win_rate_pct', 0.0)}%", None, "accepted trades"),
-            render_metric("Today return", format_decimal(sum(safe_float(row.get("accepted_return_sum_pct")) for row in today_rows), 2, "%"), None, "last 24h paper"),
-            render_metric("Today trades", sum(int(safe_float(row.get("accepted"))) for row in today_rows), None, "accepted"),
-            render_metric("Best now", len(best_now_rows), None, "TRADE/WATCH"),
         ]
     )
     style = """
@@ -1273,6 +1290,7 @@ def render_dashboard(state, status_filter="ALL"):
     .metric-label { color: var(--muted-foreground); font-size: 12px; font-weight: 600; text-transform: uppercase; }
     .metric-value { font-size: 24px; line-height: 1; font-weight: 700; word-break: break-word; }
     .metric-detail { color: var(--muted-foreground); font-size: 12px; }
+    .ledger-metrics { margin-bottom: 12px; }
     .module-row { display: flex; flex-wrap: wrap; gap: 6px; }
     .badge {
       display: inline-flex;
@@ -1441,8 +1459,11 @@ def render_dashboard(state, status_filter="ALL"):
         <div class="section-header">
           <div>
             <h2>Latest accepted paper trades</h2>
-            <p class="section-copy">Последние зачтенные paper-сделки из общего ledger.</p>
+            <p class="section-copy">Накопительная история paper-ledger и последние зачтенные сделки.</p>
           </div>
+        </div>
+        <div class="metrics-grid ledger-metrics">
+          {ledger_metrics_html}
         </div>
         {render_table(ledger, ['recorded_at', 'asset', 'symbol', 'strategy', 'module', 'direction', 'entry', 'exit', 'reason', 'net_return_pct', 'portfolio_return_pct'], 30)}
       </section>
