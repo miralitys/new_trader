@@ -1360,6 +1360,7 @@ def render_dashboard(state, status_filter="ALL"):
     pre {
       margin: 0;
       white-space: pre-wrap;
+      overflow-wrap: anywhere;
       border: 1px solid var(--border);
       border-radius: 8px;
       background: var(--card);
@@ -1368,11 +1369,51 @@ def render_dashboard(state, status_filter="ALL"):
       font-size: 13px;
       line-height: 1.45;
     }
+    .diagnostics-grid {
+      display: grid;
+      grid-template-columns: minmax(240px, 0.75fr) minmax(320px, 1.25fr) minmax(260px, 1fr);
+      gap: 12px;
+      align-items: start;
+    }
+    .diagnostic-card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--card);
+      padding: 14px;
+    }
+    .diagnostic-card h3 {
+      margin: 0 0 10px;
+      color: var(--foreground);
+      font-size: 14px;
+      line-height: 1.2;
+      font-weight: 700;
+    }
+    .diagnostic-lines {
+      display: grid;
+      gap: 10px;
+    }
+    .diagnostic-line {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted-foreground);
+      font-size: 13px;
+    }
+    .diagnostic-line span:first-child {
+      font-weight: 650;
+      text-transform: uppercase;
+    }
+    .diagnostic-card pre {
+      max-height: 220px;
+      overflow: auto;
+    }
     @media (max-width: 760px) {
       .shell { padding: 16px; }
       .topbar, .status-alert, .cycle-alert, .section-header { align-items: stretch; flex-direction: column; }
       .actions { justify-content: flex-start; }
       h1 { font-size: 26px; }
+      .diagnostics-grid { grid-template-columns: 1fr; }
     }
     """
     script = """
@@ -1495,17 +1536,28 @@ def render_dashboard(state, status_filter="ALL"):
             <p class="section-copy">Ошибки последнего цикла и состояния хранилища.</p>
           </div>
         </div>
-        <div class="metrics-grid">
-          {render_metric("Storage", state.get("storage_backend", "local_json"), tone_class(state.get("storage_backend")), "persistence")}
-          {render_metric("Auth", "enabled" if state.get("auth_enabled") else "disabled", tone_class("enabled" if state.get("auth_enabled") else "disabled"), "access")}
-          <div>
-            <h2>Last error</h2>
+        <div class="diagnostics-grid">
+          <section class="diagnostic-card">
+            <h3>Система</h3>
+            <div class="diagnostic-lines">
+              <div class="diagnostic-line">
+                <span>Storage</span>
+                {render_badge(state.get("storage_backend", "local_json"), tone_class(state.get("storage_backend")))}
+              </div>
+              <div class="diagnostic-line">
+                <span>Auth</span>
+                {render_badge("enabled" if state.get("auth_enabled") else "disabled", tone_class("enabled" if state.get("auth_enabled") else "disabled"))}
+              </div>
+            </div>
+          </section>
+          <section class="diagnostic-card">
+            <h3>Last error</h3>
             <pre>{html.escape(last_error) if last_error else 'None'}</pre>
-          </div>
-          <div>
-            <h2>Storage error</h2>
+          </section>
+          <section class="diagnostic-card">
+            <h3>Storage error</h3>
             <pre>{html.escape(storage_error) if storage_error else 'None'}</pre>
-          </div>
+          </section>
         </div>
       </section>
     </div>
