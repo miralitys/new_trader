@@ -611,7 +611,8 @@ def make_handler(app):
             self.wfile.write(payload)
 
         def do_GET(self):
-            path = urlparse(self.path).path
+            parsed_url = urlparse(self.path)
+            path = parsed_url.path
             if path == "/healthz":
                 self.send_json({"ok": True})
                 return
@@ -629,7 +630,8 @@ def make_handler(app):
             if path == "/":
                 if not self.require_auth():
                     return
-                self.send_html(render_dashboard(app.snapshot()))
+                query = parse_qs(parsed_url.query)
+                self.send_html(render_dashboard(app.snapshot(), query.get("status", ["ALL"])[0]))
                 return
             self.send_json({"error": "not found"}, status=404)
 
@@ -760,6 +762,7 @@ COLUMN_LABELS = {
     "net_return_pct": "Сделка",
     "portfolio_return_pct": "Портфель",
 }
+STATUS_FILTERS = ("ALL", "TRADE", "WATCH", "OFF")
 
 
 def column_label(column):
@@ -913,6 +916,72 @@ def build_strategy_board(summary_rows, monitor_rows):
     )
 
 
+def normalize_status_filter(value):
+    status = str(value or "ALL").upper()
+    return status if status in STATUS_FILTERS else "ALL"
+
+
+def count_by_status(rows):
+    counts = {status: 0 for status in STATUS_FILTERS}
+    counts["ALL"] = len(rows)
+    for row in rows:
+        status = str(row.get("status", "")).upper()
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def sorted_today_rows(strategy_board):
+    rows = [
+        row
+        for row in strategy_board
+        if row.get("signals") not in (None, "") or row.get("accepted") not in (None, "")
+    ]
+    return sorted(
+        rows,
+        key=lambda row: (
+            safe_float(row.get("accepted_return_sum_pct")),
+            safe_float(row.get("accepted")),
+            safe_float(row.get("signals")),
+            safe_float(row.get("return_30d_pct")),
+        ),
+        reverse=True,
+    )
+
+
+def sorted_best_now_rows(strategy_board):
+    rows = [row for row in strategy_board if str(row.get("status", "")).upper() in {"TRADE", "WATCH"}]
+    status_order = {"TRADE": 0, "WATCH": 1}
+    return sorted(
+        rows,
+        key=lambda row: (
+            status_order.get(str(row.get("status", "")).upper(), 2),
+            -safe_float(row.get("accepted_return_sum_pct")),
+            -safe_float(row.get("return_30d_pct")),
+            -safe_float(row.get("pf_30d")),
+            safe_float(row.get("dd_30d_pct")),
+        ),
+    )
+
+
+def filter_strategy_rows(rows, status_filter):
+    if status_filter == "ALL":
+        return rows
+    return [row for row in rows if str(row.get("status", "")).upper() == status_filter]
+
+
+def render_status_filters(status_filter, counts):
+    tone_by_status = {"ALL": "secondary", "TRADE": "success", "WATCH": "warning", "OFF": "danger"}
+    links = []
+    for status in STATUS_FILTERS:
+        active = " active" if status == status_filter else ""
+        links.append(
+            f'<a class="filter-pill {tone_by_status.get(status, "secondary")}{active}" '
+            f'href="/?status={status}">{status}<span>{counts.get(status, 0)}</span></a>'
+        )
+    return f'<nav class="filter-row" aria-label="Strategy status filters">{"".join(links)}</nav>'
+
+
 def render_login(error=""):
     style = """
     :root {
@@ -1007,11 +1076,16 @@ def render_login(error=""):
 </html>"""
 
 
-def render_dashboard(state):
+def render_dashboard(state, status_filter="ALL"):
     ledger = list(reversed(state.get("ledger", [])))
     monitor = state.get("latest_monitor", [])
     summary = state.get("latest_summary", [])
     strategy_board = build_strategy_board(summary, monitor)
+    status_filter = normalize_status_filter(status_filter)
+    status_counts = count_by_status(strategy_board)
+    today_rows = sorted_today_rows(strategy_board)
+    best_now_rows = sorted_best_now_rows(strategy_board)
+    filtered_strategy_board = filter_strategy_rows(strategy_board, status_filter)
     ledger_summary = state.get("ledger_summary", {})
     status = "RUNNING" if state.get("running") else "STOPPED"
     in_cycle = "yes" if state.get("in_cycle") else "no"
@@ -1029,7 +1103,9 @@ def render_dashboard(state):
             render_metric("Ledger return", f"{ledger_summary.get('portfolio_return_sum_pct', 0.0)}%", None, "paper ledger"),
             render_metric("Accepted trades", ledger_summary.get("accepted_trades", 0), None, "deduplicated"),
             render_metric("Win rate", f"{ledger_summary.get('win_rate_pct', 0.0)}%", None, "accepted trades"),
-            render_metric("Strategy board", len(strategy_board), None, "tracked rows"),
+            render_metric("Today return", format_decimal(sum(safe_float(row.get("accepted_return_sum_pct")) for row in today_rows), 2, "%"), None, "last 24h paper"),
+            render_metric("Today trades", sum(int(safe_float(row.get("accepted"))) for row in today_rows), None, "accepted"),
+            render_metric("Best now", len(best_now_rows), None, "TRADE/WATCH"),
         ]
     )
     style = """
@@ -1102,6 +1178,34 @@ def render_dashboard(state):
     .section { padding: 22px 0; border-bottom: 1px solid var(--border); }
     .section-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
     .section-copy { color: var(--muted-foreground); font-size: 13px; }
+    .filter-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .filter-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      height: 34px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 0 12px;
+      color: var(--muted-foreground);
+      text-decoration: none;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .filter-pill span {
+      min-width: 22px;
+      height: 22px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      background: rgb(148 163 184 / 0.12);
+      color: var(--foreground);
+    }
+    .filter-pill.success.active, .filter-pill.success:hover { border-color: rgb(34 197 94 / 0.4); background: rgb(34 197 94 / 0.12); color: hsl(142.1 76.2% 73.1%); }
+    .filter-pill.warning.active, .filter-pill.warning:hover { border-color: rgb(250 204 21 / 0.4); background: rgb(250 204 21 / 0.12); color: hsl(47.9 95.8% 73.1%); }
+    .filter-pill.danger.active, .filter-pill.danger:hover { border-color: rgb(248 113 113 / 0.4); background: rgb(248 113 113 / 0.12); color: hsl(0 93.5% 81.8%); }
+    .filter-pill.secondary.active, .filter-pill.secondary:hover { background: var(--secondary); color: var(--secondary-foreground); }
     .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
     .metric-card {
       min-height: 112px;
@@ -1145,6 +1249,9 @@ def render_dashboard(state):
     th { color: var(--muted-foreground); font-size: 12px; font-weight: 650; text-transform: uppercase; background: var(--muted); }
     tr:last-child td { border-bottom: 0; }
     tbody tr:hover { background: rgb(148 163 184 / 0.06); }
+    .today-board table { min-width: 860px; table-layout: fixed; }
+    .best-now table { min-width: 1040px; table-layout: fixed; }
+    .today-board th, .today-board td, .best-now th, .best-now td { white-space: nowrap; }
     .strategy-board table { min-width: 1180px; table-layout: fixed; }
     .strategy-board th, .strategy-board td { white-space: nowrap; }
     .strategy-board th:nth-child(1), .strategy-board td:nth-child(1) { width: 72px; }
@@ -1248,11 +1355,32 @@ def render_dashboard(state):
       <section class="section">
         <div class="section-header">
           <div>
-            <h2>Strategy board</h2>
-            <p class="section-copy">Главная сводка: текущий paper-цикл плюс 30d health по каждой стратегии.</p>
+            <h2>Сегодня, 24 часа</h2>
+            <p class="section-copy">Сигналы, зачтенные paper-сделки и доходность текущего 24h paper-цикла.</p>
           </div>
         </div>
-        {render_table(strategy_board, ['asset', 'strategy', 'side', 'status', 'signals', 'accepted', 'accepted_return_sum_pct', 'accepted_profit_factor', 'return_30d_pct', 'pf_30d', 'dd_30d_pct', 'trades_30d', 'reason'], 50, 'strategy-board')}
+        {render_table(today_rows, ['asset', 'strategy', 'side', 'status', 'signals', 'accepted', 'accepted_return_sum_pct', 'accepted_profit_factor'], 20, 'today-board')}
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Лучшие сейчас</h2>
+            <p class="section-copy">Только TRADE/WATCH, отсортировано по текущему paper-результату, 30d доходности и PF.</p>
+          </div>
+        </div>
+        {render_table(best_now_rows, ['asset', 'strategy', 'side', 'status', 'accepted_return_sum_pct', 'accepted_profit_factor', 'return_30d_pct', 'pf_30d', 'dd_30d_pct', 'trades_30d', 'reason'], 12, 'best-now')}
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Strategy board</h2>
+            <p class="section-copy">Полная таблица стратегий. Фильтр: {html.escape(status_filter)}.</p>
+          </div>
+          {render_status_filters(status_filter, status_counts)}
+        </div>
+        {render_table(filtered_strategy_board, ['asset', 'strategy', 'side', 'status', 'signals', 'accepted', 'accepted_return_sum_pct', 'accepted_profit_factor', 'return_30d_pct', 'pf_30d', 'dd_30d_pct', 'trades_30d', 'reason'], 50, 'strategy-board')}
       </section>
 
       <section class="section">
