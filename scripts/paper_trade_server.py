@@ -711,6 +711,68 @@ def numeric_tone(value):
     return "positive" if parsed > 0 else "negative"
 
 
+PCT_COLUMNS = {
+    "paper_return_sum_pct",
+    "accepted_return_sum_pct",
+    "net_return_pct",
+    "portfolio_return_pct",
+    "return_30d_pct",
+    "return_60d_pct",
+    "strict_return_30d_pct",
+    "taker_return_30d_pct",
+    "accepted_expectancy_pct",
+    "paper_expectancy_pct",
+    "expectancy_30d_pct",
+    "expectancy_60d_pct",
+    "win_30d_pct",
+    "win_60d_pct",
+    "fill_rate_pct",
+    "dd_30d_pct",
+    "dd_60d_pct",
+    "strict_dd_30d_pct",
+    "taker_dd_30d_pct",
+}
+PF_COLUMNS = {"accepted_profit_factor", "paper_profit_factor", "pf_30d", "pf_60d", "strict_pf_30d", "taker_pf_30d"}
+COLUMN_LABELS = {
+    "asset": "Монета",
+    "symbol": "Пара",
+    "strategy": "Стратегия",
+    "side": "Сторона",
+    "status": "Статус",
+    "signals": "Сигн.",
+    "filled": "Исп.",
+    "accepted": "Прин.",
+    "fill_rate_pct": "Fill",
+    "accepted_return_sum_pct": "Paper",
+    "accepted_profit_factor": "PF",
+    "return_30d_pct": "30d",
+    "pf_30d": "30d PF",
+    "dd_30d_pct": "30d DD",
+    "trades_30d": "30d сделок",
+    "reason": "Причина",
+    "paper_return_sum_pct": "Paper",
+    "paper_profit_factor": "PF",
+    "recorded_at": "Время",
+    "module": "Модуль",
+    "direction": "Сторона",
+    "entry": "Вход",
+    "exit": "Выход",
+    "net_return_pct": "Сделка",
+    "portfolio_return_pct": "Портфель",
+}
+
+
+def column_label(column):
+    return COLUMN_LABELS.get(column, column)
+
+
+def format_decimal(value, decimals=2, suffix=""):
+    parsed = nullable_float(value)
+    if parsed is None:
+        return str(value if value not in (None, "") else "0")
+    return f"{parsed:.{decimals}f}{suffix}"
+
+
 def render_badge(value, tone=None):
     label = html.escape(str(value if value not in (None, "") else "none"))
     badge_tone = tone or tone_class(value)
@@ -722,11 +784,15 @@ def render_cell(column, value):
         return html.escape(display_time(value))
     if column in {"status", "side", "direction", "order_status", "portfolio_status", "storage_backend"}:
         return render_badge(value)
+    if column in {"reason", "stress_reason", "notes"}:
+        full = str(value or "")
+        short = full if len(full) <= 130 else full[:127] + "..."
+        return f'<span class="reason" title="{html.escape(full)}">{html.escape(short)}</span>'
     if column in {"dd_30d_pct", "dd_60d_pct", "strict_dd_30d_pct", "taker_dd_30d_pct"}:
         parsed = nullable_float(value)
         tone = "negative" if parsed and parsed > 0 else "muted-value"
-        return f'<span class="{tone}">{html.escape(str(value if value not in (None, "") else "0"))}</span>'
-    if column in {"accepted_profit_factor", "paper_profit_factor", "pf_30d", "pf_60d", "strict_pf_30d", "taker_pf_30d"}:
+        return f'<span class="{tone}">{html.escape(format_decimal(value, 2, "%"))}</span>'
+    if column in PF_COLUMNS:
         parsed = nullable_float(value)
         if parsed is None or parsed == 0:
             tone = "muted-value"
@@ -734,40 +800,23 @@ def render_cell(column, value):
             tone = "positive"
         else:
             tone = "negative"
-        return f'<span class="{tone}">{html.escape(str(value if value not in (None, "") else "0"))}</span>'
-    if column in {
-        "paper_return_sum_pct",
-        "accepted_return_sum_pct",
-        "net_return_pct",
-        "portfolio_return_pct",
-        "return_30d_pct",
-        "return_60d_pct",
-        "strict_return_30d_pct",
-        "taker_return_30d_pct",
-        "accepted_expectancy_pct",
-        "paper_expectancy_pct",
-        "expectancy_30d_pct",
-        "expectancy_60d_pct",
-        "win_30d_pct",
-        "win_60d_pct",
-        "fill_rate_pct",
-    }:
-        return f'<span class="{numeric_tone(value)}">{html.escape(str(value if value not in (None, "") else "0"))}</span>'
-    if column in {"reason", "stress_reason", "notes"}:
-        return f'<span class="reason">{html.escape(str(value or ""))}</span>'
+        return f'<span class="{tone}">{html.escape(format_decimal(value, 2))}</span>'
+    if column in PCT_COLUMNS:
+        return f'<span class="{numeric_tone(value)}">{html.escape(format_decimal(value, 2, "%"))}</span>'
     return html.escape(str(value if value is not None else ""))
 
 
-def render_table(rows, columns, limit=20):
+def render_table(rows, columns, limit=20, class_name=""):
     rows = rows[:limit]
     if not rows:
         return '<div class="empty-state">No rows yet.</div>'
-    header = "".join(f"<th>{html.escape(col)}</th>" for col in columns)
+    header = "".join(f"<th>{html.escape(column_label(col))}</th>" for col in columns)
     body_rows = []
     for row in rows:
         cells = "".join(f"<td>{render_cell(col, row.get(col, ''))}</td>" for col in columns)
         body_rows.append(f"<tr>{cells}</tr>")
-    return f'<div class="table-shell"><table><thead><tr>{header}</tr></thead><tbody>{"".join(body_rows)}</tbody></table></div>'
+    shell_class = f"table-shell {class_name}".strip()
+    return f'<div class="{shell_class}"><table><thead><tr>{header}</tr></thead><tbody>{"".join(body_rows)}</tbody></table></div>'
 
 
 def render_metric(label, value, tone=None, detail=""):
@@ -1096,6 +1145,21 @@ def render_dashboard(state):
     th { color: var(--muted-foreground); font-size: 12px; font-weight: 650; text-transform: uppercase; background: var(--muted); }
     tr:last-child td { border-bottom: 0; }
     tbody tr:hover { background: rgb(148 163 184 / 0.06); }
+    .strategy-board table { min-width: 1180px; table-layout: fixed; }
+    .strategy-board th, .strategy-board td { white-space: nowrap; }
+    .strategy-board th:nth-child(1), .strategy-board td:nth-child(1) { width: 72px; }
+    .strategy-board th:nth-child(2), .strategy-board td:nth-child(2) { width: 170px; }
+    .strategy-board th:nth-child(3), .strategy-board td:nth-child(3) { width: 78px; }
+    .strategy-board th:nth-child(4), .strategy-board td:nth-child(4) { width: 82px; }
+    .strategy-board th:nth-child(5), .strategy-board td:nth-child(5) { width: 72px; }
+    .strategy-board th:nth-child(6), .strategy-board td:nth-child(6) { width: 72px; }
+    .strategy-board th:nth-child(7), .strategy-board td:nth-child(7) { width: 86px; }
+    .strategy-board th:nth-child(8), .strategy-board td:nth-child(8) { width: 76px; }
+    .strategy-board th:nth-child(9), .strategy-board td:nth-child(9) { width: 86px; }
+    .strategy-board th:nth-child(10), .strategy-board td:nth-child(10) { width: 76px; }
+    .strategy-board th:nth-child(11), .strategy-board td:nth-child(11) { width: 82px; }
+    .strategy-board th:nth-child(12), .strategy-board td:nth-child(12) { width: 96px; }
+    .strategy-board th:nth-child(13), .strategy-board td:nth-child(13) { width: 260px; }
     .empty-state {
       min-height: 96px;
       display: grid;
@@ -1105,7 +1169,14 @@ def render_dashboard(state):
       color: var(--muted-foreground);
       background: rgb(148 163 184 / 0.03);
     }
-    .reason { color: var(--muted-foreground); }
+    .reason {
+      display: block;
+      max-width: 100%;
+      overflow: hidden;
+      color: var(--muted-foreground);
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .positive { color: hsl(142.1 76.2% 73.1%); font-weight: 650; }
     .negative { color: hsl(0 93.5% 81.8%); font-weight: 650; }
     .muted-value { color: var(--muted-foreground); }
@@ -1181,7 +1252,7 @@ def render_dashboard(state):
             <p class="section-copy">Главная сводка: текущий paper-цикл плюс 30d health по каждой стратегии.</p>
           </div>
         </div>
-        {render_table(strategy_board, ['asset', 'strategy', 'side', 'status', 'signals', 'filled', 'accepted', 'fill_rate_pct', 'accepted_return_sum_pct', 'accepted_profit_factor', 'return_30d_pct', 'pf_30d', 'dd_30d_pct', 'trades_30d', 'reason'], 50)}
+        {render_table(strategy_board, ['asset', 'strategy', 'side', 'status', 'signals', 'accepted', 'accepted_return_sum_pct', 'accepted_profit_factor', 'return_30d_pct', 'pf_30d', 'dd_30d_pct', 'trades_30d', 'reason'], 50, 'strategy-board')}
       </section>
 
       <section class="section">
