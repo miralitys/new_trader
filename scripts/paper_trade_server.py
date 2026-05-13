@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,12 @@ STATE_PATH = DATA_DIR / "state.json"
 STATE_ID = os.environ.get("PAPER_STATE_ID", "default")
 AUTH_COOKIE = "paper_dashboard_auth"
 MAX_LEDGER_ROWS = 1000
+DISPLAY_TZ_NAME = os.environ.get("PAPER_DASHBOARD_TIMEZONE", "America/Chicago")
+try:
+    DISPLAY_TZ = ZoneInfo(DISPLAY_TZ_NAME)
+except Exception:
+    DISPLAY_TZ_NAME = "America/Chicago"
+    DISPLAY_TZ = ZoneInfo(DISPLAY_TZ_NAME)
 DEFAULT_MODULES = ("RIF", "GALA_10", "GALA_112", "ANKR", "SPELL", "DYDX_X2")
 MODULE_STRATEGIES = {
     "ANKR": {"ANKR LONG Best"},
@@ -52,6 +59,23 @@ def utc_now():
 
 def compact_timestamp():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def display_time(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(DISPLAY_TZ).strftime("%d.%m.%Y %H:%M:%S %Z")
+
+
+def is_time_column(column):
+    return column.endswith("_at") or column.endswith("_time") or column in {"time", "recorded_at"}
 
 
 def dashboard_password():
@@ -694,6 +718,8 @@ def render_badge(value, tone=None):
 
 
 def render_cell(column, value):
+    if is_time_column(column):
+        return html.escape(display_time(value))
     if column in {"status", "side", "direction", "order_status", "portfolio_status", "storage_backend"}:
         return render_badge(value)
     if column in {"dd_30d_pct", "dd_60d_pct", "strict_dd_30d_pct", "taker_dd_30d_pct"}:
@@ -942,7 +968,7 @@ def render_dashboard(state):
     in_cycle = "yes" if state.get("in_cycle") else "no"
     last_error = state.get("last_error") or ""
     storage_error = state.get("storage_error") or ""
-    last_run = state.get("last_run_at") or "not yet"
+    last_run = display_time(state.get("last_run_at")) if state.get("last_run_at") else "not yet"
     modules = state.get("modules", [])
     modules_html = "".join(render_badge(module, "secondary") for module in modules)
     metrics_html = "\n".join(
