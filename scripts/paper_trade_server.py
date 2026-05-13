@@ -9,6 +9,8 @@ local dashboard/API for live observation.
 
 import argparse
 import csv
+import hashlib
+import hmac
 import html
 import importlib
 import json
@@ -22,7 +24,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +32,7 @@ DATA_DIR = ROOT / "data" / "paper_live"
 LOG_DIR = ROOT / "logs"
 STATE_PATH = DATA_DIR / "state.json"
 STATE_ID = os.environ.get("PAPER_STATE_ID", "default")
+AUTH_COOKIE = "paper_dashboard_auth"
 MAX_LEDGER_ROWS = 1000
 DEFAULT_MODULES = ("RIF", "GALA_10", "GALA_112", "ANKR", "SPELL", "DYDX_X2")
 MODULE_STRATEGIES = {
@@ -49,6 +52,14 @@ def utc_now():
 
 def compact_timestamp():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def dashboard_password():
+    return os.environ.get("PAPER_DASHBOARD_PASSWORD") or os.environ.get("DASHBOARD_PASSWORD") or ""
+
+
+def dashboard_token(password):
+    return hmac.new(password.encode("utf-8"), b"paper-dashboard-session", hashlib.sha256).hexdigest()
 
 
 def read_csv(path):
@@ -306,6 +317,8 @@ class PaperTradeApp:
         self.running = not args.no_autostart
         self.in_cycle = False
         self.stop_event = threading.Event()
+        self.auth_password = dashboard_password()
+        self.auth_token = dashboard_token(self.auth_password) if self.auth_password else ""
         self.store, storage_error = make_state_store()
         self.state = self.store.load(default_state(args))
         self.state["mode"] = "paper_only"
@@ -315,6 +328,7 @@ class PaperTradeApp:
         self.state["monitor_enabled"] = not args.skip_monitor
         self.state["storage_backend"] = self.store.backend
         self.state["storage_error"] = storage_error
+        self.state["auth_enabled"] = bool(self.auth_password)
         self.worker = threading.Thread(target=self.worker_loop, name="paper-trade-loop", daemon=True)
         self.save_state()
 
@@ -336,6 +350,7 @@ class PaperTradeApp:
 
     def save_state(self):
         self.state["storage_backend"] = self.store.backend
+        self.state["auth_enabled"] = bool(self.auth_password)
         try:
             self.store.save(self.state)
         except Exception as exc:
@@ -518,39 +533,85 @@ def make_handler(app):
     class Handler(BaseHTTPRequestHandler):
         server_version = "PaperTradeServer/1.0"
 
-        def send_json(self, payload, status=200):
+        def is_authenticated(self):
+            if not app.auth_password:
+                return True
+            raw_cookie = self.headers.get("Cookie", "")
+            cookies = {}
+            for part in raw_cookie.split(";"):
+                if "=" not in part:
+                    continue
+                key, value = part.strip().split("=", 1)
+                cookies[key] = value
+            return hmac.compare_digest(cookies.get(AUTH_COOKIE, ""), app.auth_token)
+
+        def require_auth(self, json_response=False):
+            if self.is_authenticated():
+                return True
+            if json_response:
+                self.send_json({"error": "auth required"}, status=401)
+            else:
+                self.send_html(render_login(), status=200)
+            return False
+
+        def read_form(self):
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            body = self.rfile.read(min(length, 16384)).decode("utf-8")
+            return parse_qs(body)
+
+        def send_redirect(self, location, headers=None):
+            self.send_response(303)
+            self.send_header("Location", location)
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
+            self.end_headers()
+
+        def send_json(self, payload, status=200, headers=None):
             body = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 
-        def send_html(self, body, status=200):
+        def send_html(self, body, status=200, headers=None):
             payload = body.encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(payload)
 
         def do_GET(self):
             path = urlparse(self.path).path
+            if path == "/healthz":
+                self.send_json({"ok": True})
+                return
             if path == "/api/state":
+                if not self.require_auth(json_response=True):
+                    return
                 self.send_json(app.snapshot())
                 return
             if path == "/api/run-once":
+                if not self.require_auth(json_response=True):
+                    return
                 threading.Thread(target=app.run_cycle, kwargs={"manual": True}, daemon=True).start()
                 self.send_json({"status": "started"})
                 return
             if path == "/":
+                if not self.require_auth():
+                    return
                 self.send_html(render_dashboard(app.snapshot()))
                 return
             self.send_json({"error": "not found"}, status=404)
 
         def do_HEAD(self):
             path = urlparse(self.path).path
-            if path in {"/", "/api/state"}:
+            if path in {"/", "/api/state", "/healthz"}:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8" if path == "/" else "application/json; charset=utf-8")
                 self.end_headers()
@@ -560,15 +621,40 @@ def make_handler(app):
 
         def do_POST(self):
             path = urlparse(self.path).path
+            if path == "/api/login":
+                form = self.read_form()
+                password = form.get("password", [""])[0]
+                if app.auth_password and hmac.compare_digest(password, app.auth_password):
+                    self.send_redirect(
+                        "/",
+                        headers={
+                            "Set-Cookie": f"{AUTH_COOKIE}={app.auth_token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000"
+                        },
+                    )
+                    return
+                self.send_html(render_login("Неверный пароль"), status=401)
+                return
+            if path == "/api/logout":
+                self.send_redirect(
+                    "/",
+                    headers={"Set-Cookie": f"{AUTH_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"},
+                )
+                return
             if path == "/api/start":
+                if not self.require_auth(json_response=True):
+                    return
                 app.set_running(True)
                 self.send_json({"running": True})
                 return
             if path == "/api/stop":
+                if not self.require_auth(json_response=True):
+                    return
                 app.set_running(False)
                 self.send_json({"running": False})
                 return
             if path == "/api/run-once":
+                if not self.require_auth(json_response=True):
+                    return
                 threading.Thread(target=app.run_cycle, kwargs={"manual": True}, daemon=True).start()
                 self.send_json({"status": "started"})
                 return
@@ -593,6 +679,40 @@ def render_table(rows, columns, limit=20):
         cells = "".join(f"<td>{html.escape(str(row.get(col, '')))}</td>" for col in columns)
         body_rows.append(f"<tr>{cells}</tr>")
     return f"<table><thead><tr>{header}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+
+
+def render_login(error=""):
+    style = """
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; min-height: 100vh; background: #0f1419; color: #e6edf3; display: grid; place-items: center; }
+    main { width: min(420px, calc(100vw - 32px)); background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 24px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { color: #8b949e; margin: 0 0 18px; }
+    label { display: block; font-weight: 700; margin-bottom: 8px; }
+    input { box-sizing: border-box; width: 100%; background: #0f1419; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 11px 12px; font-size: 16px; }
+    button { width: 100%; margin-top: 14px; background: #238636; color: white; border: 0; padding: 11px 12px; border-radius: 6px; font-size: 16px; cursor: pointer; }
+    .error { color: #ff7b72; margin-top: 12px; }
+    """
+    error_html = f"<div class=\"error\">{html.escape(error)}</div>" if error else ""
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Paper Trade Login</title>
+  <style>{style}</style>
+</head>
+<body>
+  <main>
+    <h1>Paper Trade Server</h1>
+    <p>Введите пароль для доступа к панели.</p>
+    <form method="post" action="/api/login">
+      <label for="password">Пароль</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" autofocus>
+      <button type="submit">Войти</button>
+    </form>
+    {error_html}
+  </main>
+</body>
+</html>"""
 
 
 def render_dashboard(state):
@@ -640,6 +760,7 @@ def render_dashboard(state):
     <button onclick="post('/api/start')">Start</button>
     <button class="stop" onclick="post('/api/stop')">Stop</button>
     <button class="run" onclick="post('/api/run-once')">Run Once</button>
+    <form method="post" action="/api/logout" style="display:inline"><button class="stop" type="submit">Logout</button></form>
     <a class="muted" href="/api/state">JSON state</a>
   </p>
   <div class="grid">
@@ -649,6 +770,7 @@ def render_dashboard(state):
     <div class="card"><strong>Modules</strong><br>{html.escape(', '.join(state.get('modules', [])))}</div>
     <div class="card"><strong>Last Run</strong><br>{html.escape(str(state.get('last_run_at', '')))}</div>
     <div class="card"><strong>Storage</strong><br>{html.escape(str(state.get('storage_backend', 'local_json')))}</div>
+    <div class="card"><strong>Auth</strong><br>{'enabled' if state.get('auth_enabled') else 'disabled'}</div>
     <div class="card"><strong>Ledger Return</strong><br>{html.escape(str(ledger_summary.get('portfolio_return_sum_pct', 0.0)))}%</div>
     <div class="card"><strong>Accepted Trades</strong><br>{html.escape(str(ledger_summary.get('accepted_trades', 0)))}</div>
     <div class="card"><strong>Win Rate</strong><br>{html.escape(str(ledger_summary.get('win_rate_pct', 0.0)))}%</div>

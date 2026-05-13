@@ -32,6 +32,17 @@ If `DATABASE_URL` is missing or unavailable, the service falls back to
 `data/paper_live/state.json`. That is useful locally, but Render's filesystem is
 ephemeral, so this mode should not be used for long-term history.
 
+## Dashboard Password
+
+Add this Render environment variable to protect the public dashboard:
+
+```bash
+PAPER_DASHBOARD_PASSWORD=your-strong-password
+```
+
+When the variable is present, the dashboard and API actions require login. If it
+is missing, the dashboard stays open.
+
 ## Notes
 
 - If Render blocks Binance global endpoints with HTTP 451, keep
