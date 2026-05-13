@@ -16,6 +16,7 @@ import importlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -775,6 +776,8 @@ COLUMN_LABELS = {
     "net_return_pct": "Сделка",
     "portfolio_return_pct": "Портфель",
     "last_trade_time": "Последняя",
+    "off_summary": "Почему OFF",
+    "recovery_hint": "Что улучшить",
 }
 STATUS_FILTERS = ("ALL", "TRADE", "WATCH", "OFF")
 
@@ -801,7 +804,7 @@ def render_cell(column, value):
         return html.escape(display_time(value))
     if column in {"status", "side", "direction", "order_status", "portfolio_status", "storage_backend"}:
         return render_badge(value)
-    if column in {"reason", "stress_reason", "notes"}:
+    if column in {"reason", "stress_reason", "notes", "off_summary", "recovery_hint"}:
         full = str(value or "")
         short = full if len(full) <= 130 else full[:127] + "..."
         return f'<span class="reason" title="{html.escape(full)}">{html.escape(short)}</span>'
@@ -1023,6 +1026,192 @@ def aggregate_ledger_by_strategy(rows, strategy_board):
         ),
         reverse=True,
     )
+
+
+def unique_ordered(items):
+    seen = set()
+    result = []
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def translate_off_reason(row):
+    reason = str(row.get("reason") or "")
+    lower = reason.lower()
+    points = []
+    hints = []
+
+    match = re.search(r"(?:paper\s+)?return\s+([+-]?[0-9.]+)%?\s*<=\s*([+-]?[0-9.]+)", reason, flags=re.IGNORECASE)
+    if match:
+        value = match.group(1)
+        points.append(f"доходность не положительная: {value}%")
+        hints.append("дождаться положительной доходности")
+
+    match = re.search(r"\bpf\s+([0-9.]+)\s*<\s*([0-9.]+)", reason, flags=re.IGNORECASE)
+    if match:
+        points.append(f"PF слабый: {match.group(1)} < {match.group(2)}")
+        hints.append("подождать, пока PF станет выше фильтра")
+
+    match = re.search(r"paper accepted\s+(\d+)\s*<\s*(\d+)", reason, flags=re.IGNORECASE)
+    if match:
+        points.append(f"мало paper-сделок: {match.group(1)} из {match.group(2)}")
+        hints.append("дождаться большего числа зачтенных paper-сделок")
+
+    match = re.search(r"\btrades\s+(\d+)\s*<\s*(\d+)", reason, flags=re.IGNORECASE)
+    if match:
+        points.append(f"мало сделок в истории: {match.group(1)} из {match.group(2)}")
+        hints.append("набрать больше сделок в окне проверки")
+
+    if "paper weak" in lower and not any("paper" in point for point in points):
+        points.append("слабая свежая paper-проверка")
+        hints.append("проверить следующий цикл paper-торговли")
+
+    if "health" in lower and "30d" in lower:
+        points.append("30d здоровье слабое")
+        hints.append("дождаться восстановления 30d/60d показателей")
+
+    if "stress" in lower and ("fail" in lower or "failed" in lower):
+        points.append("не прошла стресс исполнения")
+        hints.append("не включать без улучшения исполнения")
+
+    if "dd" in lower or "drawdown" in lower:
+        points.append("просадка выше фильтра")
+        hints.append("дождаться снижения просадки")
+
+    if not points:
+        points.append("не прошла текущие фильтры монитора")
+        if reason:
+            hints.append("посмотреть полную причину в Strategy board")
+        else:
+            hints.append("дождаться нового цикла с данными")
+
+    return " · ".join(unique_ordered(points)[:3]), " · ".join(unique_ordered(hints)[:2])
+
+
+def build_off_reason_rows(strategy_board):
+    rows = []
+    for row in strategy_board:
+        if str(row.get("status", "")).upper() != "OFF":
+            continue
+        summary, hint = translate_off_reason(row)
+        item = dict(row)
+        item["off_summary"] = summary
+        item["recovery_hint"] = hint
+        rows.append(item)
+    return sorted(
+        rows,
+        key=lambda row: (
+            safe_float(row.get("accepted_return_sum_pct")),
+            safe_float(row.get("return_30d_pct")),
+            -safe_float(row.get("dd_30d_pct")),
+        ),
+        reverse=True,
+    )
+
+
+def recent_accepted_ledger_rows_by_days(ledger, days=7):
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    rows = []
+    for row in ledger:
+        if row.get("portfolio_status") != "accepted":
+            continue
+        event_time = trade_event_time(row)
+        if not event_time or event_time < cutoff or event_time > now + timedelta(minutes=5):
+            continue
+        enriched = dict(row)
+        enriched["_event_time"] = event_time
+        rows.append(enriched)
+    return sorted(rows, key=lambda row: row["_event_time"])
+
+
+def last_display_dates(days=7):
+    today = datetime.now(DISPLAY_TZ).date()
+    return [today - timedelta(days=offset) for offset in range(days - 1, -1, -1)]
+
+
+def build_daily_history_rows(ledger_rows, best_now_rows, days=7):
+    day_keys = last_display_dates(days)
+    day_key_set = set(day_keys)
+    rows_by_key = {}
+    for row in best_now_rows:
+        key = strategy_key(row)
+        rows_by_key[key] = {
+            "asset": row.get("asset", ""),
+            "strategy": row.get("strategy", ""),
+            "status": row.get("status", ""),
+            "total_7d_pct": 0.0,
+            "trades_7d": 0,
+            "days": {day: {"return": 0.0, "trades": 0} for day in day_keys},
+        }
+
+    if not rows_by_key:
+        return [], day_keys
+
+    for row in recent_accepted_ledger_rows_by_days(ledger_rows, days=days):
+        key = strategy_key(row)
+        if key not in rows_by_key:
+            continue
+        event_time = row.get("_event_time") or trade_event_time(row)
+        if not event_time:
+            continue
+        day = event_time.astimezone(DISPLAY_TZ).date()
+        if day not in day_key_set:
+            continue
+        value = safe_float(row.get("portfolio_return_pct") or row.get("net_return_pct"))
+        item = rows_by_key[key]
+        item["total_7d_pct"] += value
+        item["trades_7d"] += 1
+        item["days"][day]["return"] += value
+        item["days"][day]["trades"] += 1
+
+    return sorted(
+        rows_by_key.values(),
+        key=lambda row: (
+            safe_float(row.get("total_7d_pct")),
+            safe_float(row.get("trades_7d")),
+        ),
+        reverse=True,
+    ), day_keys
+
+
+def render_daily_history_table(rows, day_keys):
+    if not rows:
+        return '<div class="empty-state">Нет TRADE/WATCH стратегий для 7-дневной истории.</div>'
+    header_cells = [
+        "Монета",
+        "Стратегия",
+        "Статус",
+        "7d PnL",
+        "Сделок",
+        *[day.strftime("%d.%m") for day in day_keys],
+    ]
+    header = "".join(f"<th>{html.escape(label)}</th>" for label in header_cells)
+    body_rows = []
+    for row in rows:
+        cells = [
+            html.escape(str(row.get("asset", ""))),
+            html.escape(str(row.get("strategy", ""))),
+            render_badge(row.get("status", "")),
+            f'<span class="{numeric_tone(row.get("total_7d_pct"))}">{html.escape(format_decimal(row.get("total_7d_pct"), 2, "%"))}</span>',
+            html.escape(str(row.get("trades_7d", 0))),
+        ]
+        for day in day_keys:
+            day_data = row["days"][day]
+            if day_data["trades"] == 0:
+                cells.append('<span class="muted-value">—</span>')
+            else:
+                cells.append(
+                    f'<span class="{numeric_tone(day_data["return"])}">{html.escape(format_decimal(day_data["return"], 2, "%"))}</span>'
+                    f'<span class="day-trades">{day_data["trades"]}</span>'
+                )
+        body_rows.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
+    return f'<div class="table-shell daily-history"><table><thead><tr>{header}</tr></thead><tbody>{"".join(body_rows)}</tbody></table></div>'
 
 
 def sorted_today_rows(strategy_board):
@@ -1258,6 +1447,9 @@ def render_dashboard(state, status_filter="ALL"):
     today_ledger_rows = recent_accepted_ledger_rows(ledger_rows, hours=24)
     today_rows = aggregate_ledger_by_strategy(today_ledger_rows, strategy_board)
     best_now_rows = sorted_best_now_rows(strategy_board)
+    off_reason_rows = build_off_reason_rows(strategy_board)
+    daily_history_rows, daily_history_days = build_daily_history_rows(ledger_rows, best_now_rows, days=7)
+    daily_history_html = render_daily_history_table(daily_history_rows, daily_history_days)
     filtered_strategy_board = filter_strategy_rows(strategy_board, status_filter)
     ledger_summary = state.get("ledger_summary", {})
     today_pnl = sum(safe_float(row.get("portfolio_return_pct") or row.get("net_return_pct")) for row in today_ledger_rows)
@@ -1554,6 +1746,25 @@ def render_dashboard(state, status_filter="ALL"):
     .today-board table { min-width: 860px; table-layout: fixed; }
     .best-now table { min-width: 1040px; table-layout: fixed; }
     .today-board th, .today-board td, .best-now th, .best-now td { white-space: nowrap; }
+    .off-reasons table { min-width: 920px; table-layout: fixed; }
+    .off-reasons th, .off-reasons td { white-space: nowrap; }
+    .off-reasons th:nth-child(1), .off-reasons td:nth-child(1) { width: 82px; }
+    .off-reasons th:nth-child(2), .off-reasons td:nth-child(2) { width: 210px; }
+    .off-reasons th:nth-child(3), .off-reasons td:nth-child(3) { width: 360px; }
+    .off-reasons th:nth-child(4), .off-reasons td:nth-child(4) { width: 320px; }
+    .daily-history table { min-width: 1120px; table-layout: fixed; }
+    .daily-history th, .daily-history td { white-space: nowrap; }
+    .daily-history th:nth-child(1), .daily-history td:nth-child(1) { width: 78px; }
+    .daily-history th:nth-child(2), .daily-history td:nth-child(2) { width: 210px; }
+    .daily-history th:nth-child(3), .daily-history td:nth-child(3) { width: 86px; }
+    .daily-history th:nth-child(4), .daily-history td:nth-child(4) { width: 86px; }
+    .daily-history th:nth-child(5), .daily-history td:nth-child(5) { width: 72px; }
+    .day-trades {
+      margin-left: 6px;
+      color: var(--muted-foreground);
+      font-size: 11px;
+      font-weight: 600;
+    }
     .strategy-board table { min-width: 1180px; table-layout: fixed; }
     .strategy-board th, .strategy-board td { white-space: nowrap; }
     .strategy-board th:nth-child(1), .strategy-board td:nth-child(1) { width: 72px; }
@@ -1718,6 +1929,26 @@ def render_dashboard(state, status_filter="ALL"):
           </div>
         </div>
         {render_table(best_now_rows, ['asset', 'strategy', 'side', 'status', 'accepted_return_sum_pct', 'accepted_profit_factor', 'return_30d_pct', 'pf_30d', 'dd_30d_pct', 'trades_30d', 'reason'], 12, 'best-now')}
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Почему OFF</h2>
+            <p class="section-copy">Короткий перевод причин отключения. Стратегия продолжает мониториться и может вернуться в WATCH/TRADE.</p>
+          </div>
+        </div>
+        {render_table(off_reason_rows, ['asset', 'strategy', 'off_summary', 'recovery_hint'], 30, 'off-reasons')}
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>История 7 дней</h2>
+            <p class="section-copy">Дневной paper-PnL по текущим TRADE/WATCH стратегиям. Маленькое число рядом с днем — количество сделок.</p>
+          </div>
+        </div>
+        {daily_history_html}
       </section>
 
       <section class="section">
