@@ -28,6 +28,8 @@ the full fixed strategy universe from `data/operational_monitor_universe_2026-05
 The server also has RIF-only mode enabled by default, so an old Render Start
 Command cannot accidentally re-enable the removed modules. Set
 `PAPER_RIF_ONLY=0` only if you intentionally want to restore the broader monitor.
+On startup, RIF-only mode also purges old non-RIF dashboard history from the
+saved state and the Postgres trade archive, leaving only RIF records visible.
 The heavier operational monitor runs every 15 paper cycles by default, while
 manual "Run Once" always refreshes it immediately.
 

@@ -44,6 +44,7 @@ except Exception:
     DISPLAY_TZ = ZoneInfo(DISPLAY_TZ_NAME)
 DEFAULT_MODULES = ("RIF",)
 RIF_ONLY_MODE = os.environ.get("PAPER_RIF_ONLY", "1").strip().lower() not in {"0", "false", "no", "off"}
+RIF_STRATEGY = "RIF Regime Monitor"
 MODULE_STRATEGIES = {
     "ANKR": {"ANKR LONG Best"},
     "RIF": {"RIF Regime Monitor"},
@@ -151,6 +152,14 @@ def nullable_float(value):
     return parsed if math.isfinite(parsed) else None
 
 
+def is_rif_row(row):
+    asset = str(row.get("asset", "")).upper()
+    symbol = str(row.get("symbol", "")).upper()
+    strategy = str(row.get("strategy", ""))
+    module = str(row.get("module", "")).upper()
+    return asset == "RIF" or symbol == "RIFUSDT" or strategy == RIF_STRATEGY or module == "RIF"
+
+
 def load_json(path, default):
     if not path.exists():
         return default
@@ -204,6 +213,9 @@ class LocalStateStore:
         save_json(STATE_PATH, payload)
 
     def record_trades(self, rows):
+        return None
+
+    def purge_non_rif_history(self):
         return None
 
 
@@ -326,6 +338,21 @@ class PostgresStateStore:
                     )
         return None
 
+    def purge_non_rif_history(self):
+        with closing(self.connect()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM paper_trade_trades
+                    WHERE COALESCE(asset, '') <> 'RIF'
+                      AND COALESCE(symbol, '') <> 'RIFUSDT'
+                      AND COALESCE(strategy, '') <> %s
+                      AND COALESCE(module, '') <> 'RIF'
+                    """,
+                    (RIF_STRATEGY,),
+                )
+        return None
+
 
 def make_state_store():
     database_url = os.environ.get("DATABASE_URL", "").strip()
@@ -349,6 +376,24 @@ def summarize_ledger(ledger):
         "win_rate_pct": round((len(wins) / len(accepted) * 100.0), 2) if accepted else 0.0,
         "portfolio_return_sum_pct": round(total_return, 4),
     }
+
+
+def sanitize_rif_only_state(state):
+    state["modules"] = ["RIF"]
+    state["monitor_universe"] = "modules"
+
+    ledger = [row for row in state.get("ledger", []) if is_rif_row(row)]
+    state["ledger"] = ledger[-MAX_LEDGER_ROWS:]
+    state["seen_trade_keys"] = [row.get("paper_trade_key") or trade_key(row) for row in state["ledger"]]
+    state["ledger_summary"] = summarize_ledger(state["ledger"])
+
+    for key in ("latest_summary", "latest_monitor"):
+        if isinstance(state.get(key), list):
+            state[key] = [row for row in state[key] if is_rif_row(row)]
+
+    state["monitor_strategy_count"] = len(state.get("latest_monitor", []))
+    state["updated_at"] = utc_now()
+    return state
 
 
 def write_module_universe(modules, path, mode="all"):
@@ -396,6 +441,12 @@ class PaperTradeApp:
         self.state["storage_backend"] = self.store.backend
         self.state["storage_error"] = storage_error
         self.state["auth_enabled"] = bool(self.auth_password)
+        if RIF_ONLY_MODE:
+            self.state = sanitize_rif_only_state(self.state)
+            try:
+                self.store.purge_non_rif_history()
+            except Exception as exc:
+                self.state["storage_error"] = f"RIF-only history purge failed: {exc}"
         self.worker = threading.Thread(target=self.worker_loop, name="paper-trade-loop", daemon=True)
         self.save_state()
 
