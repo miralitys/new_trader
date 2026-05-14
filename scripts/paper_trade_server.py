@@ -42,7 +42,7 @@ try:
 except Exception:
     DISPLAY_TZ_NAME = "America/Chicago"
     DISPLAY_TZ = ZoneInfo(DISPLAY_TZ_NAME)
-DEFAULT_MODULES = ("RIF", "GALA_10", "GALA_112", "ANKR", "SPELL", "DYDX_X2")
+DEFAULT_MODULES = ("RIF",)
 MODULE_STRATEGIES = {
     "ANKR": {"ANKR LONG Best"},
     "RIF": {"RIF Regime Monitor"},

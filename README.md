@@ -13,7 +13,7 @@ python3 -m venv .venv && .venv/bin/python -m pip install --upgrade pip && .venv/
 Start command:
 
 ```bash
-.venv/bin/python scripts/paper_trade_server.py --host 0.0.0.0 --port $PORT --interval-sec 120 --days 1 --warmup-days 10 --market data_api_spot --entry-mode maker_limit --modules ANKR RIF GALA_73 GALA_10 GALA_112 SPELL --monitor-universe all --monitor-every-cycles 15
+.venv/bin/python scripts/paper_trade_server.py --host 0.0.0.0 --port $PORT --interval-sec 120 --days 1 --warmup-days 10 --market data_api_spot --entry-mode maker_limit --modules RIF --monitor-universe modules --monitor-every-cycles 15
 ```
 
 The service never sends exchange orders and does not need API keys. It only
@@ -21,9 +21,10 @@ downloads public market data, runs paper execution checks, and exposes a small
 dashboard. The Render web service runs the live paper loop and stores state in
 Postgres when `DATABASE_URL` is present.
 
-`--modules` controls only the live paper-execution journal. With
-`--monitor-universe all`, the dashboard's operational board still checks the
-full fixed strategy universe from `data/operational_monitor_universe_2026-05-04.csv`.
+`--modules RIF` keeps the live paper-execution journal focused on RIF only. With
+`--monitor-universe modules`, the dashboard's operational board also checks only
+the strategies mapped to the selected module, so Render does not waste cycles on
+the full fixed strategy universe from `data/operational_monitor_universe_2026-05-04.csv`.
 The heavier operational monitor runs every 15 paper cycles by default, while
 manual "Run Once" always refreshes it immediately.
 
