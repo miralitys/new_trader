@@ -25,6 +25,9 @@ Postgres when `DATABASE_URL` is present.
 `--monitor-universe modules`, the dashboard's operational board also checks only
 the strategies mapped to the selected module, so Render does not waste cycles on
 the full fixed strategy universe from `data/operational_monitor_universe_2026-05-04.csv`.
+The server also has RIF-only mode enabled by default, so an old Render Start
+Command cannot accidentally re-enable the removed modules. Set
+`PAPER_RIF_ONLY=0` only if you intentionally want to restore the broader monitor.
 The heavier operational monitor runs every 15 paper cycles by default, while
 manual "Run Once" always refreshes it immediately.
 

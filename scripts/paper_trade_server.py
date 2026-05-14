@@ -43,6 +43,7 @@ except Exception:
     DISPLAY_TZ_NAME = "America/Chicago"
     DISPLAY_TZ = ZoneInfo(DISPLAY_TZ_NAME)
 DEFAULT_MODULES = ("RIF",)
+RIF_ONLY_MODE = os.environ.get("PAPER_RIF_ONLY", "1").strip().lower() not in {"0", "false", "no", "off"}
 MODULE_STRATEGIES = {
     "ANKR": {"ANKR LONG Best"},
     "RIF": {"RIF Regime Monitor"},
@@ -2127,7 +2128,11 @@ def parse_args():
     parser.add_argument("--monitor-days", type=int, default=7)
     parser.add_argument("--monitor-stress-window", type=int, default=7)
     parser.add_argument("--monitor-skip-stress", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if RIF_ONLY_MODE:
+        args.modules = ["RIF"]
+        args.monitor_universe = "modules"
+    return args
 
 
 def main():
