@@ -28,6 +28,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
+from stage3_forward_monitor import Stage3ForwardMonitor
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data" / "paper_live"
@@ -54,6 +56,47 @@ MODULE_STRATEGIES = {
     "SPELL": {"SPELL SHORT Best"},
     "DYDX_X2": {"DYDX Pullback SHORT x2 Protected"},
 }
+STAGE3_STATE_PATH = DATA_DIR / "stage3_state.json"
+STAGE3_REGISTRY_SOURCE = ROOT / "Report" / "Stage2" / "stage2_deep_validation_pairs_2026-05-16.csv"
+STAGE3_CONFIG = {
+    "trading_mode": "paper",
+    "initial_equity": 1000.0,
+    "fee_pct": 0.0004,
+    "slippage_pct": 0.0002,
+    "max_open_positions": 5,
+    "max_same_direction_positions": 3,
+    "max_positions_per_coin": 1,
+    "max_daily_loss_pct": 0.01,
+    "max_weekly_loss_pct": 0.03,
+    "core_risk_per_trade": 0.0025,
+    "liquidity_risk_per_trade": 0.001,
+    "watch_risk_per_trade": 0.0,
+    "min_forward_trades_to_evaluate": 30,
+    "min_portfolio_trades_to_evaluate": 100,
+    "max_spread": 0.0015,
+    "min_liquidity": 20000.0,
+    "funding_danger_threshold": 0.0010,
+    "time_stop_minutes": 24 * 60,
+    "max_notional_pct": 1.0,
+}
+STAGE3_TRADE_STATUSES = {"core", "liquidity_risk"}
+STAGE3_SIGNAL_FIELDS = (
+    "coin",
+    "strategy",
+    "timeframe",
+    "direction",
+    "signal_time",
+    "candle_close_time",
+    "entry_price",
+    "stop_price",
+    "take_profit_price",
+    "market_regime",
+    "indicators_snapshot",
+    "spread",
+    "volume",
+    "funding",
+    "expected_R",
+)
 
 
 def utc_now():
@@ -429,6 +472,14 @@ class PaperTradeApp:
         self.auth_password = dashboard_password()
         self.auth_token = dashboard_token(self.auth_password) if self.auth_password else ""
         self.store, storage_error = make_state_store()
+        self.stage3 = Stage3ForwardMonitor(
+            root=ROOT,
+            data_dir=DATA_DIR,
+            state_path=STAGE3_STATE_PATH,
+            registry_source=STAGE3_REGISTRY_SOURCE,
+            config=STAGE3_CONFIG,
+            database_url=os.environ.get("DATABASE_URL", ""),
+        )
         self.state = self.store.load(default_state(args))
         self.state["mode"] = "paper_only"
         self.state["market"] = args.market
@@ -703,6 +754,18 @@ def make_handler(app):
             body = self.rfile.read(min(length, 16384)).decode("utf-8")
             return parse_qs(body)
 
+        def read_json(self):
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            if length <= 0:
+                return {}
+            body = self.rfile.read(min(length, 2_000_000)).decode("utf-8")
+            if not body.strip():
+                return {}
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid json: {exc}") from exc
+
         def send_redirect(self, location, headers=None):
             self.send_response(303)
             self.send_header("Location", location)
@@ -747,6 +810,46 @@ def make_handler(app):
                 threading.Thread(target=app.run_cycle, kwargs={"manual": True}, daemon=True).start()
                 self.send_json({"status": "started"})
                 return
+            if path == "/new-strategies":
+                if not self.require_auth():
+                    return
+                self.send_html(render_new_strategies_dashboard(app.stage3.snapshot()))
+                return
+            if path == "/api/new-strategies/registry":
+                if not self.require_auth(json_response=True):
+                    return
+                self.send_json({"registry": app.stage3.snapshot().get("registry", [])})
+                return
+            if path == "/api/new-strategies/active-strategies":
+                if not self.require_auth(json_response=True):
+                    return
+                self.send_json({"active_strategies": app.stage3.active_strategies()})
+                return
+            if path == "/api/new-strategies/signals":
+                if not self.require_auth(json_response=True):
+                    return
+                self.send_json({"signals": app.stage3.snapshot().get("signals", [])})
+                return
+            if path == "/api/new-strategies/skipped-signals":
+                if not self.require_auth(json_response=True):
+                    return
+                self.send_json({"skipped_signals": app.stage3.snapshot().get("skipped_signals", [])})
+                return
+            if path == "/api/new-strategies/open-trades":
+                if not self.require_auth(json_response=True):
+                    return
+                self.send_json({"open_trades": app.stage3.snapshot().get("open_trades", [])})
+                return
+            if path == "/api/new-strategies/closed-trades":
+                if not self.require_auth(json_response=True):
+                    return
+                self.send_json({"closed_trades": app.stage3.snapshot().get("closed_trades", [])})
+                return
+            if path == "/api/new-strategies/performance":
+                if not self.require_auth(json_response=True):
+                    return
+                self.send_json(app.stage3.snapshot().get("performance", {}))
+                return
             if path == "/":
                 if not self.require_auth():
                     return
@@ -757,9 +860,9 @@ def make_handler(app):
 
         def do_HEAD(self):
             path = urlparse(self.path).path
-            if path in {"/", "/api/state", "/healthz"}:
+            if path in {"/", "/new-strategies", "/api/state", "/healthz"}:
                 self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8" if path == "/" else "application/json; charset=utf-8")
+                self.send_header("Content-Type", "text/html; charset=utf-8" if path in {"/", "/new-strategies"} else "application/json; charset=utf-8")
                 self.end_headers()
                 return
             self.send_response(404)
@@ -804,6 +907,33 @@ def make_handler(app):
                 threading.Thread(target=app.run_cycle, kwargs={"manual": True}, daemon=True).start()
                 self.send_json({"status": "started"})
                 return
+            if path == "/api/new-strategies/signals":
+                if not self.require_auth(json_response=True):
+                    return
+                try:
+                    payload = self.read_json()
+                    self.send_json(app.stage3.ingest_signals(payload))
+                except ValueError as exc:
+                    self.send_json({"error": str(exc)}, status=400)
+                return
+            if path == "/api/new-strategies/price-update":
+                if not self.require_auth(json_response=True):
+                    return
+                try:
+                    payload = self.read_json()
+                    self.send_json(app.stage3.update_prices(payload))
+                except ValueError as exc:
+                    self.send_json({"error": str(exc)}, status=400)
+                return
+            if path == "/api/new-strategies/orders":
+                if not self.require_auth(json_response=True):
+                    return
+                try:
+                    payload = self.read_json()
+                except ValueError:
+                    payload = {}
+                self.send_json(app.stage3.reject_real_order(payload), status=403)
+                return
             self.send_json({"error": "not found"}, status=404)
 
         def log_message(self, fmt, *args):
@@ -817,11 +947,11 @@ def make_handler(app):
 
 def tone_class(value):
     text = str(value or "").strip().lower()
-    if text in {"trade", "running", "yes", "filled", "accepted", "ok", "postgres", "enabled"}:
+    if text in {"trade", "running", "yes", "filled", "accepted", "ok", "postgres", "enabled", "core", "opened", "open"}:
         return "success"
-    if text in {"watch", "already_running"}:
+    if text in {"watch", "already_running", "liquidity_risk"}:
         return "warning"
-    if text in {"off", "stopped", "no", "error", "rejected", "local_json", "disabled"}:
+    if text in {"off", "stopped", "no", "error", "rejected", "local_json", "disabled", "skipped", "closed"}:
         return "danger"
     return "secondary"
 
@@ -853,8 +983,13 @@ PCT_COLUMNS = {
     "dd_60d_pct",
     "strict_dd_30d_pct",
     "taker_dd_30d_pct",
+    "win_rate_pct",
+    "win_rate",
+    "max_dd_pct",
+    "net_pnl_pct",
+    "return_pct",
 }
-PF_COLUMNS = {"accepted_profit_factor", "paper_profit_factor", "pf_30d", "pf_60d", "strict_pf_30d", "taker_pf_30d"}
+PF_COLUMNS = {"accepted_profit_factor", "paper_profit_factor", "pf_30d", "pf_60d", "strict_pf_30d", "taker_pf_30d", "profit_factor"}
 COLUMN_LABELS = {
     "asset": "Монета",
     "symbol": "Пара",
@@ -884,6 +1019,48 @@ COLUMN_LABELS = {
     "last_trade_time": "Последняя",
     "off_summary": "Почему OFF",
     "recovery_hint": "Что улучшить",
+    "coin": "Монета",
+    "timeframe": "TF",
+    "received_at": "Получен",
+    "signal_time": "Сигнал",
+    "candle_close_time": "Закрытие свечи",
+    "entry_price": "Вход",
+    "stop_price": "SL",
+    "take_profit_price": "TP",
+    "market_regime": "Режим",
+    "spread": "Spread",
+    "volume": "Объем",
+    "funding": "Funding",
+    "expected_R": "Exp. R",
+    "skip_reason": "Причина пропуска",
+    "source_signal_id": "Signal ID",
+    "entry_time": "Вход время",
+    "exit_time": "Выход время",
+    "exit_price": "Выход",
+    "qty": "Qty",
+    "notional": "Notional",
+    "net_pnl": "Net PnL",
+    "net_pnl_pct": "Net %",
+    "r_multiple": "R",
+    "exit_reason": "Причина выхода",
+    "duration_min": "Мин.",
+    "equity_after": "Equity",
+    "total_signals": "Сигн.",
+    "skipped_signals": "Skip",
+    "opened_trades": "Открыто",
+    "closed_trades": "Закрыто",
+    "win_rate": "Win %",
+    "profit_factor": "PF",
+    "max_dd_pct": "Max DD",
+    "average_r": "Avg R",
+    "longest_losing_streak": "Loss streak",
+    "group_by": "Группа",
+    "regime": "Режим",
+    "stage2_decision": "Stage2",
+    "score": "Score",
+    "return_pct": "Return",
+    "liquidity_label": "Liquidity",
+    "avg_minute_quote_volume": "Avg $/min",
 }
 STATUS_FILTERS = ("ALL", "TRADE", "WATCH", "OFF")
 
@@ -1449,6 +1626,18 @@ def best_today_summary(today_rows):
     return str(asset), f"{strategy} / {result}"
 
 
+def render_nav_tabs(active="live"):
+    items = [
+        ("live", "Live Monitor", "/"),
+        ("new", "New Strategies", "/new-strategies"),
+    ]
+    links = []
+    for key, label, href in items:
+        active_class = " active" if key == active else ""
+        links.append(f'<a class="tab-link{active_class}" href="{href}">{html.escape(label)}</a>')
+    return f'<nav class="page-tabs" aria-label="Main sections">{"".join(links)}</nav>'
+
+
 def render_login(error=""):
     style = """
     :root {
@@ -1537,6 +1726,407 @@ def render_login(error=""):
         <button type="submit">Войти</button>
       </form>
       {error_html}
+    </div>
+  </main>
+</body>
+</html>"""
+
+
+def flatten_stage3_registry(rows):
+    flattened = []
+    for row in rows:
+        metadata = row.get("metadata") or {}
+        item = dict(row)
+        item["stage2_decision"] = metadata.get("stage2_decision", "")
+        item["score"] = metadata.get("score", "")
+        item["pf"] = metadata.get("pf", "")
+        item["return_pct"] = metadata.get("return_pct", "")
+        item["max_dd_pct"] = metadata.get("max_dd_pct", "")
+        item["liquidity_label"] = metadata.get("liquidity_label", "")
+        item["avg_minute_quote_volume"] = metadata.get("avg_minute_quote_volume", "")
+        return_value = safe_float(item.get("return_pct"))
+        score_value = safe_float(item.get("score"))
+        item["_sort_score"] = score_value + max(return_value, 0) / 100.0
+        flattened.append(item)
+    status_order = {"core": 0, "liquidity_risk": 1, "watch": 2, "disabled": 3}
+    return sorted(
+        flattened,
+        key=lambda row: (
+            status_order.get(str(row.get("status", "")), 9),
+            -safe_float(row.get("_sort_score")),
+            row.get("coin", ""),
+            row.get("strategy", ""),
+        ),
+    )
+
+
+def flatten_stage3_groups(rows):
+    visible = []
+    for row in rows:
+        if str(row.get("group_by")) not in {
+            "strategy",
+            "coin",
+            "timeframe",
+            "direction",
+            "strategy+coin+timeframe+direction+market_regime",
+        }:
+            continue
+        item = dict(row)
+        if str(item.get("group_by")) == "strategy+coin+timeframe+direction+market_regime":
+            item["group_by"] = "combo"
+        visible.append(item)
+    return sorted(
+        visible,
+        key=lambda row: (
+            safe_float(row.get("closed_trades")),
+            safe_float(row.get("net_pnl")),
+            safe_float(row.get("profit_factor")),
+        ),
+        reverse=True,
+    )
+
+
+def format_profit_factor_value(value):
+    if str(value).strip() == "∞":
+        return "∞"
+    parsed = nullable_float(value)
+    if parsed is None:
+        return "0"
+    if math.isinf(parsed):
+        return "∞"
+    return format_decimal(parsed, 2)
+
+
+def render_new_strategies_dashboard(snapshot):
+    registry = flatten_stage3_registry(snapshot.get("registry", []))
+    signals = snapshot.get("signals", [])
+    skipped = snapshot.get("skipped_signals", [])
+    open_trades = snapshot.get("open_trades", [])
+    closed_trades = snapshot.get("closed_trades", [])
+    performance = snapshot.get("performance", {})
+    summary = performance.get("summary", {})
+    groups = flatten_stage3_groups(performance.get("groups", []))
+    counts = snapshot.get("registry_counts", {})
+    portfolio = snapshot.get("portfolio_state", {})
+    config = snapshot.get("config", {})
+    skipped_reasons = summary.get("skipped_by_reason", {})
+    skipped_reason_rows = [
+        {"reason": reason, "signals": count}
+        for reason, count in sorted(skipped_reasons.items(), key=lambda item: item[1], reverse=True)
+    ]
+    trading_mode = str(config.get("trading_mode", "paper"))
+    metrics_html = "\n".join(
+        [
+            render_metric("Trading mode", trading_mode, "success" if trading_mode == "paper" else "danger", "real orders blocked"),
+            render_metric("Core", counts.get("core", 0), "success", "can open paper trades"),
+            render_metric("Liquidity risk", counts.get("liquidity_risk", 0), "warning", "can trade, extra risk"),
+            render_metric("Watch", counts.get("watch", 0), "warning", "signals only"),
+            render_metric("Disabled", counts.get("disabled", 0), "danger", "blocked"),
+            render_metric("Open trades", len(open_trades), None, "paper positions"),
+            render_metric("Closed trades", len(closed_trades), None, "paper results"),
+            render_metric("Net PnL", format_decimal(summary.get("net_pnl", 0), 2), None, "after fees/slippage/funding estimate"),
+            render_metric("Win rate", format_decimal(summary.get("win_rate_pct", 0), 2, "%"), None, "closed trades"),
+            render_metric("PF", format_profit_factor_value(summary.get("profit_factor", 0)), None, "profit factor"),
+            render_metric("Max DD", format_decimal(summary.get("max_dd_pct", 0), 2, "%"), None, "paper equity"),
+            render_metric("Average R", format_decimal(summary.get("average_R", 0), 2), None, "per closed trade"),
+        ]
+    )
+    portfolio_html = "\n".join(
+        [
+            render_metric("Equity", format_decimal(portfolio.get("current_equity", 0), 2), None, "paper account"),
+            render_metric("Daily PnL", format_decimal(portfolio.get("daily_pnl", 0), 2), None, "closed today"),
+            render_metric("Weekly PnL", format_decimal(portfolio.get("weekly_pnl", 0), 2), None, "closed 7d"),
+            render_metric("Core risk", format_decimal(safe_float(config.get("core_risk_per_trade")) * 100, 2, "%"), None, "per trade"),
+            render_metric("Liquidity risk", format_decimal(safe_float(config.get("liquidity_risk_per_trade")) * 100, 2, "%"), None, "per trade"),
+            render_metric("Daily stop", format_decimal(safe_float(config.get("max_daily_loss_pct")) * 100, 2, "%"), None, "paper loss limit"),
+            render_metric("Weekly stop", format_decimal(safe_float(config.get("max_weekly_loss_pct")) * 100, 2, "%"), None, "paper loss limit"),
+            render_metric("Max positions", config.get("max_open_positions", 0), None, "portfolio rule"),
+            render_metric("Per coin", config.get("max_positions_per_coin", 0), None, "open position cap"),
+            render_metric("Min liquidity", format_decimal(config.get("min_liquidity", 0), 0), None, "signal volume"),
+            render_metric("Eval threshold", config.get("min_forward_trades_to_evaluate", 0), None, "trades per strategy"),
+        ]
+    )
+    style = """
+    :root {
+      --background: hsl(222.2 84% 4.9%);
+      --foreground: hsl(210 40% 98%);
+      --card: hsl(222.2 84% 4.9%);
+      --muted: hsl(217.2 32.6% 17.5%);
+      --muted-foreground: hsl(215 20.2% 65.1%);
+      --primary: hsl(210 40% 98%);
+      --primary-foreground: hsl(222.2 47.4% 11.2%);
+      --secondary: hsl(217.2 32.6% 17.5%);
+      --secondary-foreground: hsl(210 40% 98%);
+      --destructive: hsl(0 62.8% 30.6%);
+      --border: hsl(217.2 32.6% 17.5%);
+      --success: hsl(142.1 70.6% 45.3%);
+      --warning: hsl(47.9 95.8% 53.1%);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--background);
+      color: var(--foreground);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+    a { color: inherit; }
+    .shell { min-height: 100svh; padding: 24px; }
+    .workspace { max-width: 1440px; margin: 0 auto; }
+    .topbar {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .brand { display: grid; gap: 8px; }
+    .eyebrow { color: var(--muted-foreground); font-size: 12px; font-weight: 650; text-transform: uppercase; }
+    h1 { margin: 0; font-size: 30px; line-height: 1.15; font-weight: 750; }
+    h2 { margin: 0; font-size: 18px; line-height: 1.2; font-weight: 700; }
+    h3 { margin: 0; font-size: 14px; font-weight: 700; }
+    p { margin: 0; color: var(--muted-foreground); line-height: 1.5; }
+    .actions, .page-tabs { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .page-tabs { margin-top: 6px; }
+    .tab-link, .button-link {
+      height: 36px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      padding: 0 12px;
+      background: transparent;
+      color: var(--muted-foreground);
+      font-size: 14px;
+      font-weight: 650;
+      text-decoration: none;
+    }
+    .tab-link.active, .tab-link:hover, .button-link { background: var(--secondary); color: var(--secondary-foreground); }
+    .section { padding: 22px 0; border-bottom: 1px solid var(--border); }
+    .section-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+    .section-copy { color: var(--muted-foreground); font-size: 13px; }
+    .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+    .metric-card {
+      min-height: 112px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--card);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .metric-label { color: var(--muted-foreground); font-size: 12px; font-weight: 650; text-transform: uppercase; }
+    .metric-value { font-size: 24px; line-height: 1; font-weight: 750; word-break: break-word; }
+    .metric-value.compact { font-size: 18px; line-height: 1.25; }
+    .metric-detail { color: var(--muted-foreground); font-size: 12px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .badge.success { border-color: rgb(34 197 94 / 0.35); background: rgb(34 197 94 / 0.12); color: hsl(142.1 76.2% 73.1%); }
+    .badge.warning { border-color: rgb(250 204 21 / 0.35); background: rgb(250 204 21 / 0.12); color: hsl(47.9 95.8% 73.1%); }
+    .badge.danger { border-color: rgb(248 113 113 / 0.35); background: rgb(248 113 113 / 0.12); color: hsl(0 93.5% 81.8%); }
+    .badge.secondary { background: var(--secondary); color: var(--secondary-foreground); }
+    .table-shell {
+      width: 100%;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--card);
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { height: 42px; padding: 10px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; white-space: nowrap; }
+    th { color: var(--muted-foreground); font-size: 12px; font-weight: 650; text-transform: uppercase; background: var(--muted); }
+    tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: rgb(148 163 184 / 0.06); }
+    .registry-table table { min-width: 1220px; table-layout: fixed; }
+    .signal-table table, .trade-table table, .metrics-table table { min-width: 1120px; table-layout: fixed; }
+    .empty-state {
+      min-height: 96px;
+      display: grid;
+      place-items: center;
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      color: var(--muted-foreground);
+      background: rgb(148 163 184 / 0.03);
+    }
+    .reason {
+      display: block;
+      max-width: 100%;
+      overflow: hidden;
+      color: var(--muted-foreground);
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .positive { color: hsl(142.1 76.2% 73.1%); font-weight: 650; }
+    .negative { color: hsl(0 93.5% 81.8%); font-weight: 650; }
+    .muted-value { color: var(--muted-foreground); }
+    .api-strip {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 8px;
+    }
+    .api-strip a {
+      min-height: 40px;
+      display: flex;
+      align-items: center;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0 12px;
+      color: var(--muted-foreground);
+      text-decoration: none;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .api-strip a:hover { background: var(--secondary); color: var(--foreground); }
+    @media (max-width: 760px) {
+      .shell { padding: 16px; }
+      .topbar, .section-header { align-items: stretch; flex-direction: column; }
+      .actions { justify-content: flex-start; }
+      h1 { font-size: 26px; }
+    }
+    """
+    script = "setTimeout(() => location.reload(), 30000);"
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>New Strategies - Stage 3</title>
+  <style>{style}</style>
+  <script>{script}</script>
+</head>
+<body>
+  <main class="shell">
+    <div class="workspace">
+      <header class="topbar">
+        <div class="brand">
+          <div class="eyebrow">Stage 3 forward monitor</div>
+          <h1>New Strategies</h1>
+          <p>Paper-only проверка новых стратегий: сигнал, фильтр риска, виртуальная сделка, выход и метрики.</p>
+          {render_nav_tabs("new")}
+        </div>
+        <div class="actions">
+          <a class="button-link" href="/api/new-strategies/performance">Performance JSON</a>
+          <a class="button-link" href="/api/new-strategies/registry">Registry JSON</a>
+        </div>
+      </header>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Overview</h2>
+            <p class="section-copy">Текущий paper-портфель и правила допуска. Обновлено: {html.escape(display_time(snapshot.get("updated_at", "")))}.</p>
+          </div>
+        </div>
+        <div class="metrics-grid">
+          {metrics_html}
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Portfolio rules</h2>
+            <p class="section-copy">Размер позиции считается от риска на стоп. Реальные ордера не отправляются.</p>
+          </div>
+        </div>
+        <div class="metrics-grid">
+          {portfolio_html}
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>API endpoints</h2>
+            <p class="section-copy">Сюда подключаются генераторы сигналов и обновления цены.</p>
+          </div>
+        </div>
+        <div class="api-strip">
+          <a href="/api/new-strategies/active-strategies">GET /api/new-strategies/active-strategies</a>
+          <a href="/api/new-strategies/signals">GET /api/new-strategies/signals</a>
+          <a href="/api/new-strategies/skipped-signals">GET /api/new-strategies/skipped-signals</a>
+          <a href="/api/new-strategies/open-trades">GET /api/new-strategies/open-trades</a>
+          <a href="/api/new-strategies/closed-trades">GET /api/new-strategies/closed-trades</a>
+          <a href="/api/new-strategies/performance">GET /api/new-strategies/performance</a>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Active strategy registry</h2>
+            <p class="section-copy">core и liquidity_risk могут открывать paper-сделки. watch только пишет сигналы в журнал.</p>
+          </div>
+        </div>
+        {render_table(registry, ['coin', 'strategy', 'timeframe', 'status', 'direction', 'stage2_decision', 'score', 'pf', 'return_pct', 'max_dd_pct', 'liquidity_label', 'avg_minute_quote_volume'], 80, 'registry-table')}
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Latest signals</h2>
+            <p class="section-copy">Все входящие сигналы: открытые и пропущенные.</p>
+          </div>
+        </div>
+        {render_table(signals, ['received_at', 'coin', 'strategy', 'timeframe', 'direction', 'status', 'skip_reason', 'entry_price', 'stop_price', 'take_profit_price', 'spread', 'volume', 'funding', 'expected_R'], 40, 'signal-table')}
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Skipped signals</h2>
+            <p class="section-copy">Почему Stage 3 не открыл paper-сделку.</p>
+          </div>
+        </div>
+        {render_table(skipped, ['received_at', 'coin', 'strategy', 'timeframe', 'direction', 'skip_reason', 'spread', 'volume', 'funding', 'market_regime'], 40, 'signal-table')}
+        <div style="height:12px"></div>
+        {render_table(skipped_reason_rows, ['reason', 'signals'], 20, 'signal-table')}
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Open paper trades</h2>
+            <p class="section-copy">Одна открытая позиция на монету, без реального исполнения на бирже.</p>
+          </div>
+        </div>
+        {render_table(open_trades, ['coin', 'strategy', 'timeframe', 'direction', 'entry_time', 'entry_price', 'stop_price', 'take_profit_price', 'qty', 'notional', 'risk_amount'], 40, 'trade-table')}
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Closed paper trades</h2>
+            <p class="section-copy">Закрытие по TP, SL или time-stop. Если TP и SL внутри одной свечи, считается SL первым.</p>
+          </div>
+        </div>
+        {render_table(closed_trades, ['coin', 'strategy', 'timeframe', 'direction', 'exit_time', 'exit_reason', 'entry_price', 'exit_price', 'net_pnl', 'net_pnl_pct', 'r_multiple', 'equity_after'], 60, 'trade-table')}
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <h2>Performance summary</h2>
+            <p class="section-copy">Группировка по стратегии, монете, таймфрейму, направлению и рыночному режиму.</p>
+          </div>
+        </div>
+        {render_table(groups, ['group_by', 'coin', 'strategy', 'timeframe', 'direction', 'regime', 'total_signals', 'skipped_signals', 'opened_trades', 'closed_trades', 'win_rate', 'net_pnl', 'profit_factor', 'max_dd_pct', 'average_r', 'longest_losing_streak'], 80, 'metrics-table')}
+      </section>
     </div>
   </main>
 </body>
@@ -1662,6 +2252,21 @@ def render_dashboard(state, status_filter="ALL"):
     h2 { margin: 0; font-size: 18px; line-height: 1.2; font-weight: 650; }
     p { margin: 0; color: var(--muted-foreground); line-height: 1.5; }
     .actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+    .page-tabs { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+    .tab-link {
+      height: 36px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      padding: 0 12px;
+      color: var(--muted-foreground);
+      font-size: 14px;
+      font-weight: 650;
+      text-decoration: none;
+    }
+    .tab-link.active, .tab-link:hover { background: var(--secondary); color: var(--secondary-foreground); }
     button, .button-link {
       height: 36px;
       display: inline-flex;
@@ -2000,6 +2605,7 @@ def render_dashboard(state, status_filter="ALL"):
           <div class="eyebrow">Paper trade server</div>
           <h1>Live strategy monitor</h1>
           <p>Paper-only монитор. Биржевые ордера и API-ключи не используются.</p>
+          {render_nav_tabs("live")}
         </div>
         <div class="actions">
           <button class="primary" onclick="post('/api/start')">Start</button>
