@@ -989,7 +989,7 @@ PCT_COLUMNS = {
     "net_pnl_pct",
     "return_pct",
 }
-PF_COLUMNS = {"accepted_profit_factor", "paper_profit_factor", "pf_30d", "pf_60d", "strict_pf_30d", "taker_pf_30d", "profit_factor"}
+PF_COLUMNS = {"accepted_profit_factor", "paper_profit_factor", "pf", "pf_30d", "pf_60d", "strict_pf_30d", "taker_pf_30d", "profit_factor"}
 COLUMN_LABELS = {
     "asset": "Монета",
     "symbol": "Пара",
@@ -1108,6 +1108,8 @@ def render_cell(column, value):
         return f'<span class="{tone}">{html.escape(format_decimal(value, 2))}</span>'
     if column in PCT_COLUMNS:
         return f'<span class="{numeric_tone(value)}">{html.escape(format_decimal(value, 2, "%"))}</span>'
+    if column in {"score", "avg_minute_quote_volume", "qty", "notional", "risk_amount", "entry_price", "stop_price", "take_profit_price", "exit_price", "net_pnl", "r_multiple"}:
+        return html.escape(format_decimal(value, 2))
     return html.escape(str(value if value is not None else ""))
 
 
@@ -1947,11 +1949,32 @@ def render_new_strategies_dashboard(snapshot):
       background: var(--card);
     }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { height: 42px; padding: 10px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; white-space: nowrap; }
+    th, td {
+      height: 42px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      vertical-align: middle;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     th { color: var(--muted-foreground); font-size: 12px; font-weight: 650; text-transform: uppercase; background: var(--muted); }
     tr:last-child td { border-bottom: 0; }
     tbody tr:hover { background: rgb(148 163 184 / 0.06); }
-    .registry-table table { min-width: 1220px; table-layout: fixed; }
+    .registry-table table { min-width: 1360px; table-layout: fixed; }
+    .registry-table th:nth-child(1), .registry-table td:nth-child(1) { width: 116px; }
+    .registry-table th:nth-child(2), .registry-table td:nth-child(2) { width: 260px; }
+    .registry-table th:nth-child(3), .registry-table td:nth-child(3) { width: 70px; }
+    .registry-table th:nth-child(4), .registry-table td:nth-child(4) { width: 118px; }
+    .registry-table th:nth-child(5), .registry-table td:nth-child(5) { width: 88px; }
+    .registry-table th:nth-child(6), .registry-table td:nth-child(6) { width: 150px; }
+    .registry-table th:nth-child(7), .registry-table td:nth-child(7) { width: 82px; text-align: right; }
+    .registry-table th:nth-child(8), .registry-table td:nth-child(8) { width: 72px; text-align: right; }
+    .registry-table th:nth-child(9), .registry-table td:nth-child(9) { width: 104px; text-align: right; }
+    .registry-table th:nth-child(10), .registry-table td:nth-child(10) { width: 98px; text-align: right; }
+    .registry-table th:nth-child(11), .registry-table td:nth-child(11) { width: 104px; }
+    .registry-table th:nth-child(12), .registry-table td:nth-child(12) { width: 118px; text-align: right; }
     .signal-table table, .trade-table table, .metrics-table table { min-width: 1120px; table-layout: fixed; }
     .empty-state {
       min-height: 96px;
