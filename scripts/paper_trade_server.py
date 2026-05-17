@@ -78,6 +78,11 @@ STAGE3_CONFIG = {
     "funding_danger_threshold": 0.0010,
     "time_stop_minutes": 24 * 60,
     "max_notional_pct": 1.0,
+    "signal_runner_enabled": os.environ.get("STAGE3_SIGNAL_RUNNER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"},
+    "signal_runner_market": os.environ.get("STAGE3_SIGNAL_RUNNER_MARKET", "data_api_spot"),
+    "signal_runner_include_watch": os.environ.get("STAGE3_SIGNAL_RUNNER_INCLUDE_WATCH", "0").strip().lower() in {"1", "true", "yes", "on"},
+    "signal_runner_limit": int(os.environ.get("STAGE3_SIGNAL_RUNNER_LIMIT", "260")),
+    "signal_runner_min_bars": int(os.environ.get("STAGE3_SIGNAL_RUNNER_MIN_BARS", "220")),
 }
 STAGE3_TRADE_STATUSES = {"core", "liquidity_risk"}
 STAGE3_SIGNAL_FIELDS = (
@@ -634,12 +639,21 @@ class PaperTradeApp:
             "monitor_path": monitor_rel,
             "journal": {},
             "monitor": {},
+            "stage3": {},
             "new_trades": 0,
         }
 
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             LOG_DIR.mkdir(parents=True, exist_ok=True)
+            if self.args.stage3_runner_enabled:
+                try:
+                    cycle["stage3"] = self.stage3.run_signal_cycle(
+                        market=self.args.stage3_runner_market,
+                        include_watch=self.args.stage3_runner_include_watch,
+                    )
+                except Exception as exc:
+                    cycle["stage3"] = {"status": "error", "error": str(exc)[:6000], "finished_at": utc_now()}
             cycle["journal"] = self.run_subprocess(journal_cmd)
             if cycle["journal"]["returncode"] != 0:
                 raise RuntimeError(cycle["journal"]["output"])
@@ -850,6 +864,16 @@ def make_handler(app):
                     return
                 self.send_json(app.stage3.snapshot().get("performance", {}))
                 return
+            if path == "/api/new-strategies/run-signal-cycle":
+                if not self.require_auth(json_response=True):
+                    return
+                self.send_json(
+                    app.stage3.run_signal_cycle(
+                        market=app.args.stage3_runner_market,
+                        include_watch=app.args.stage3_runner_include_watch,
+                    )
+                )
+                return
             if path == "/":
                 if not self.require_auth():
                     return
@@ -924,6 +948,16 @@ def make_handler(app):
                     self.send_json(app.stage3.update_prices(payload))
                 except ValueError as exc:
                     self.send_json({"error": str(exc)}, status=400)
+                return
+            if path == "/api/new-strategies/run-signal-cycle":
+                if not self.require_auth(json_response=True):
+                    return
+                self.send_json(
+                    app.stage3.run_signal_cycle(
+                        market=app.args.stage3_runner_market,
+                        include_watch=app.args.stage3_runner_include_watch,
+                    )
+                )
                 return
             if path == "/api/new-strategies/orders":
                 if not self.require_auth(json_response=True):
@@ -1811,6 +1845,8 @@ def render_new_strategies_dashboard(snapshot):
     counts = snapshot.get("registry_counts", {})
     portfolio = snapshot.get("portfolio_state", {})
     config = snapshot.get("config", {})
+    runner = snapshot.get("runner", {})
+    runner_summary = runner.get("last_summary") or {}
     skipped_reasons = summary.get("skipped_by_reason", {})
     skipped_reason_rows = [
         {"reason": reason, "signals": count}
@@ -1846,6 +1882,18 @@ def render_new_strategies_dashboard(snapshot):
             render_metric("Per coin", config.get("max_positions_per_coin", 0), None, "open position cap"),
             render_metric("Min liquidity", format_decimal(config.get("min_liquidity", 0), 0), None, "signal volume"),
             render_metric("Eval threshold", config.get("min_forward_trades_to_evaluate", 0), None, "trades per strategy"),
+        ]
+    )
+    runner_html = "\n".join(
+        [
+            render_metric("Runner", "enabled" if runner.get("enabled") else "disabled", "success" if runner.get("enabled") else "danger", "internal signal generator"),
+            render_metric("Market data", runner.get("market") or config.get("signal_runner_market", ""), None, "Binance kline source"),
+            render_metric("Last run", display_time(runner.get("last_run_at")) if runner.get("last_run_at") else "not yet", None, "server-side cycle"),
+            render_metric("Pairs checked", runner_summary.get("pairs_checked", 0), None, "registry pairs"),
+            render_metric("Signals generated", runner_summary.get("signals_generated", 0), None, "last cycle"),
+            render_metric("Signals opened", runner_summary.get("signals_opened", 0), None, "last cycle"),
+            render_metric("Duplicates skipped", runner_summary.get("duplicates_skipped", 0), None, "same candle"),
+            render_metric("Runner errors", len(runner_summary.get("errors", [])), "danger" if runner_summary.get("errors") else None, "last cycle"),
         ]
     )
     style = """
@@ -2075,6 +2123,18 @@ def render_new_strategies_dashboard(snapshot):
       <section class="section">
         <div class="section-header">
           <div>
+            <h2>Signal runner</h2>
+            <p class="section-copy">Встроенный генератор берет закрытые свечи Binance, строит сигналы по registry и передает их в paper-monitor.</p>
+          </div>
+        </div>
+        <div class="metrics-grid">
+          {runner_html}
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
             <h2>API endpoints</h2>
             <p class="section-copy">Сюда подключаются генераторы сигналов и обновления цены.</p>
           </div>
@@ -2086,6 +2146,7 @@ def render_new_strategies_dashboard(snapshot):
           <a href="/api/new-strategies/open-trades">GET /api/new-strategies/open-trades</a>
           <a href="/api/new-strategies/closed-trades">GET /api/new-strategies/closed-trades</a>
           <a href="/api/new-strategies/performance">GET /api/new-strategies/performance</a>
+          <a href="/api/new-strategies/run-signal-cycle">GET /api/new-strategies/run-signal-cycle</a>
         </div>
       </section>
 
@@ -2808,6 +2869,9 @@ def parse_args():
     parser.add_argument("--monitor-days", type=int, default=7)
     parser.add_argument("--monitor-stress-window", type=int, default=7)
     parser.add_argument("--monitor-skip-stress", action="store_true")
+    parser.add_argument("--stage3-runner-enabled", action=argparse.BooleanOptionalAction, default=STAGE3_CONFIG["signal_runner_enabled"])
+    parser.add_argument("--stage3-runner-market", choices=["futures_global", "spot_global", "data_api_spot", "spot_us"], default=STAGE3_CONFIG["signal_runner_market"])
+    parser.add_argument("--stage3-runner-include-watch", action="store_true", default=STAGE3_CONFIG["signal_runner_include_watch"])
     args = parser.parse_args()
     if RIF_ONLY_MODE:
         args.modules = ["RIF"]

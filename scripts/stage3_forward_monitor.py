@@ -14,11 +14,29 @@ import math
 import os
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
+KLINE_ENDPOINTS = {
+    "futures_global": "https://fapi.binance.com/fapi/v1/klines",
+    "spot_global": "https://api.binance.com/api/v3/klines",
+    "data_api_spot": "https://data-api.binance.vision/api/v3/klines",
+    "spot_us": "https://api.binance.us/api/v3/klines",
+}
+INTERVAL_MINUTES = {
+    "1m": 1,
+    "3m": 3,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "4h": 240,
+}
 DEFAULT_CONFIG = {
     "trading_mode": "paper",
     "initial_equity": 1000.0,
@@ -39,6 +57,12 @@ DEFAULT_CONFIG = {
     "funding_danger_threshold": 0.0010,
     "time_stop_minutes": 24 * 60,
     "max_notional_pct": 1.0,
+    "signal_runner_enabled": True,
+    "signal_runner_market": "data_api_spot",
+    "signal_runner_include_watch": False,
+    "signal_runner_limit": 260,
+    "signal_runner_min_bars": 220,
+    "signal_runner_user_agent": "stage3-forward-monitor/1.0",
 }
 
 TRADE_ENABLED_STATUSES = {"core", "liquidity_risk"}
@@ -158,6 +182,10 @@ def normalize_timeframe(value):
     return str(value or "").strip().lower()
 
 
+def timeframe_minutes(value):
+    return INTERVAL_MINUTES.get(normalize_timeframe(value), 0)
+
+
 def registry_key(coin, strategy, timeframe):
     return "|".join([normalize_symbol(coin), str(strategy or "").strip(), normalize_timeframe(timeframe)])
 
@@ -194,6 +222,15 @@ def default_state(config):
         "trade_events": [],
         "daily_metrics": [],
         "strategy_metrics": [],
+        "generated_signal_keys": [],
+        "runner": {
+            "enabled": bool(config.get("signal_runner_enabled", True)),
+            "market": config.get("signal_runner_market", "data_api_spot"),
+            "last_run_at": "",
+            "last_error": "",
+            "last_summary": {},
+            "cycles": 0,
+        },
         "portfolio_state": {
             "id": "default",
             "trading_mode": config.get("trading_mode", "paper"),
@@ -236,6 +273,18 @@ class Stage3ForwardMonitor:
         self.state["config"] = dict(self.config)
         self.state["storage_backend"] = "postgres" if self.driver else "local_json"
         self.state["storage_error"] = self.storage_error
+        self.state.setdefault("generated_signal_keys", [])
+        self.state.setdefault(
+            "runner",
+            {
+                "enabled": bool(self.config.get("signal_runner_enabled", True)),
+                "market": self.config.get("signal_runner_market", "data_api_spot"),
+                "last_run_at": "",
+                "last_error": "",
+                "last_summary": {},
+                "cycles": 0,
+            },
+        )
         self.ensure_portfolio_state()
         self.seed_registry()
         self.save_state()
@@ -1122,6 +1171,7 @@ class Stage3ForwardMonitor:
                 "trade_events": list(self.state.get("trade_events", [])),
                 "portfolio_state": dict(self.state.get("portfolio_state", {})),
                 "performance": performance,
+                "runner": dict(self.state.get("runner", {})),
                 "storage_backend": self.state.get("storage_backend", "local_json"),
                 "storage_error": self.state.get("storage_error", ""),
                 "updated_at": self.state.get("updated_at", ""),
@@ -1138,6 +1188,397 @@ class Stage3ForwardMonitor:
             "trading_mode": self.config.get("trading_mode", "paper"),
             "payload_received": bool(payload),
         }
+
+    def run_signal_cycle(self, market=None, include_watch=None, limit=None):
+        """Fetch latest candles, generate Stage 3 signals, and update open paper trades."""
+        started_at = utc_now()
+        market = market or self.config.get("signal_runner_market", "data_api_spot")
+        include_watch = bool(self.config.get("signal_runner_include_watch", False) if include_watch is None else include_watch)
+        limit = safe_int(limit or self.config.get("signal_runner_limit"), 260)
+        summary = {
+            "started_at": started_at,
+            "market": market,
+            "include_watch": include_watch,
+            "pairs_checked": 0,
+            "candles_fetched": 0,
+            "price_updates": 0,
+            "signals_generated": 0,
+            "signals_opened": 0,
+            "signals_skipped": 0,
+            "duplicates_skipped": 0,
+            "unsupported": 0,
+            "errors": [],
+        }
+        if not self.config.get("signal_runner_enabled", True):
+            summary["status"] = "disabled"
+            self.update_runner(summary)
+            return summary
+
+        with self.lock:
+            registry_rows = self.runner_registry_rows(include_watch=include_watch)
+            open_rows = list(self.open_trades())
+
+        fetch_keys = {(row["coin"], row["timeframe"]) for row in registry_rows}
+        fetch_keys.update((row["coin"], row.get("timeframe") or "1h") for row in open_rows)
+        candle_cache = {}
+
+        for coin, timeframe in sorted(fetch_keys):
+            if timeframe_minutes(timeframe) <= 0:
+                summary["unsupported"] += 1
+                continue
+            try:
+                candles = self.fetch_latest_candles(market, coin, timeframe, limit=limit)
+                if candles:
+                    candle_cache[(coin, timeframe)] = candles
+                    summary["candles_fetched"] += len(candles)
+                    latest = candles[-1]
+                    price_result = self.update_prices(
+                        {
+                            "coin": coin,
+                            "timeframe": timeframe,
+                            "candle_close_time": latest["close_time"],
+                            "high": latest["high"],
+                            "low": latest["low"],
+                            "close": latest["close"],
+                            "volume": latest.get("quote_volume") or latest["volume"] * latest["close"],
+                        }
+                    )
+                    summary["price_updates"] += safe_int(price_result.get("updates"))
+            except Exception as exc:
+                summary["errors"].append({"coin": coin, "timeframe": timeframe, "error": str(exc)[:240]})
+
+        signals = []
+        emitted = set(self.state.get("generated_signal_keys", []))
+        for row in registry_rows:
+            summary["pairs_checked"] += 1
+            key = (row.get("coin"), row.get("timeframe"))
+            candles = candle_cache.get(key)
+            if not candles:
+                continue
+            try:
+                signal = self.generate_signal_for_registry(row, candles)
+            except Exception as exc:
+                summary["errors"].append(
+                    {"coin": row.get("coin"), "timeframe": row.get("timeframe"), "strategy": row.get("strategy"), "error": str(exc)[:240]}
+                )
+                continue
+            if not signal:
+                continue
+            signal_key = registry_key(signal["coin"], signal["strategy"], signal["timeframe"]) + "|" + signal["candle_close_time"]
+            if signal_key in emitted:
+                summary["duplicates_skipped"] += 1
+                continue
+            emitted.add(signal_key)
+            signals.append(signal)
+
+        if signals:
+            result = self.ingest_signals(signals)
+            summary["signals_generated"] = len(signals)
+            for item in result.get("results", []):
+                if item.get("status") == "OPENED":
+                    summary["signals_opened"] += 1
+                elif item.get("status") == "SKIPPED":
+                    summary["signals_skipped"] += 1
+
+        self.state["generated_signal_keys"] = list(emitted)[-5000:]
+        summary["status"] = "ok" if not summary["errors"] else "partial"
+        summary["finished_at"] = utc_now()
+        self.update_runner(summary)
+        self.save_state()
+        return summary
+
+    def update_runner(self, summary):
+        runner = self.state.setdefault("runner", {})
+        runner["enabled"] = bool(self.config.get("signal_runner_enabled", True))
+        runner["market"] = summary.get("market") or self.config.get("signal_runner_market", "data_api_spot")
+        runner["last_run_at"] = summary.get("finished_at") or utc_now()
+        runner["last_error"] = "; ".join(item.get("error", "") for item in summary.get("errors", [])[:3])
+        runner["last_summary"] = summary
+        runner["cycles"] = safe_int(runner.get("cycles")) + 1
+
+    def runner_registry_rows(self, include_watch=False):
+        statuses = set(TRADE_ENABLED_STATUSES)
+        if include_watch:
+            statuses.add("watch")
+        rows = [
+            row
+            for row in self.state.get("registry", [])
+            if row.get("enabled", True)
+            and str(row.get("status", "")).lower() in statuses
+            and timeframe_minutes(row.get("timeframe")) > 0
+        ]
+        return sorted(rows, key=lambda row: (row.get("coin", ""), row.get("timeframe", ""), row.get("strategy", "")))
+
+    def request_json(self, url, params, retries=2):
+        query = urllib.parse.urlencode(params)
+        full_url = f"{url}?{query}"
+        headers = {"User-Agent": str(self.config.get("signal_runner_user_agent") or "stage3-forward-monitor/1.0")}
+        last_error = None
+        for attempt in range(retries):
+            try:
+                request = urllib.request.Request(full_url, headers=headers)
+                with urllib.request.urlopen(request, timeout=12) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                try:
+                    body = exc.read().decode("utf-8")
+                except Exception:
+                    body = str(exc)
+                last_error = f"HTTP {exc.code}: {body[:240]}"
+            except Exception as exc:
+                last_error = str(exc)
+            if attempt < retries - 1:
+                time.sleep(0.25 * (attempt + 1))
+        raise RuntimeError(f"Binance kline request failed: {last_error}")
+
+    def fetch_latest_candles(self, market, coin, timeframe, limit=260):
+        endpoint = KLINE_ENDPOINTS.get(market)
+        if not endpoint:
+            raise ValueError(f"Unsupported Stage 3 kline market: {market}")
+        payload = self.request_json(
+            endpoint,
+            {"symbol": normalize_symbol(coin), "interval": normalize_timeframe(timeframe), "limit": max(50, min(limit, 1000))},
+        )
+        if isinstance(payload, dict):
+            raise RuntimeError(f"Binance API error: {payload}")
+        now_ms = int(time.time() * 1000)
+        candles = []
+        for item in payload:
+            close_time_ms = int(item[6])
+            if close_time_ms > now_ms:
+                continue
+            candles.append(
+                {
+                    "open_time_ms": int(item[0]),
+                    "close_time_ms": close_time_ms,
+                    "open_time": datetime.fromtimestamp(int(item[0]) / 1000, tz=timezone.utc).isoformat(),
+                    "close_time": datetime.fromtimestamp(close_time_ms / 1000, tz=timezone.utc).isoformat(),
+                    "open": safe_float(item[1]),
+                    "high": safe_float(item[2]),
+                    "low": safe_float(item[3]),
+                    "close": safe_float(item[4]),
+                    "volume": safe_float(item[5]),
+                    "quote_volume": safe_float(item[7]) if len(item) > 7 else 0.0,
+                }
+            )
+        min_bars = safe_int(self.config.get("signal_runner_min_bars"), 220)
+        if len(candles) < min_bars:
+            raise RuntimeError(f"not enough closed candles: {len(candles)} < {min_bars}")
+        return candles
+
+    def generate_signal_for_registry(self, registry_row, candles):
+        indicators = self.calculate_indicators(candles)
+        if not indicators:
+            return None
+        decision = self.strategy_decision(registry_row, indicators)
+        if not decision:
+            return None
+        direction = decision["direction"]
+        latest = candles[-1]
+        entry = latest["close"]
+        atr = max(safe_float(indicators.get("atr14")), entry * 0.006)
+        stop_distance = max(atr * 1.25, entry * 0.004)
+        target_distance = stop_distance * 1.8
+        if direction == "long":
+            stop = entry - stop_distance
+            take_profit = entry + target_distance
+        else:
+            stop = entry + stop_distance
+            take_profit = entry - target_distance
+        if stop <= 0 or take_profit <= 0:
+            return None
+        quote_volume = latest.get("quote_volume") or latest["volume"] * entry
+        spread_estimate = min(max(((latest["high"] - latest["low"]) / entry) * 0.03, 0.0001), 0.0012)
+        expected_r = abs(take_profit - entry) / abs(entry - stop) if entry != stop else 0.0
+        return {
+            "id": id_from_key("sig", registry_key(registry_row["coin"], registry_row["strategy"], registry_row["timeframe"]) + "|" + latest["close_time"]),
+            "coin": registry_row["coin"],
+            "strategy": registry_row["strategy"],
+            "timeframe": registry_row["timeframe"],
+            "direction": direction,
+            "signal_time": latest["close_time"],
+            "candle_close_time": latest["close_time"],
+            "entry_price": entry,
+            "stop_price": stop,
+            "take_profit_price": take_profit,
+            "market_regime": indicators.get("market_regime", "unknown"),
+            "indicators_snapshot": {**indicators, "decision_reason": decision.get("reason", "")},
+            "spread": spread_estimate,
+            "volume": quote_volume,
+            "funding": 0.0,
+            "expected_R": expected_r,
+        }
+
+    def calculate_indicators(self, candles):
+        closes = [row["close"] for row in candles]
+        highs = [row["high"] for row in candles]
+        lows = [row["low"] for row in candles]
+        opens = [row["open"] for row in candles]
+        volumes = [row.get("quote_volume") or row["volume"] * row["close"] for row in candles]
+        if len(closes) < 220:
+            return {}
+        ema20 = self.ema(closes, 20)
+        ema50 = self.ema(closes, 50)
+        ema200 = self.ema(closes, 200)
+        atr14 = self.atr(highs, lows, closes, 14)
+        rsi14 = self.rsi(closes, 14)
+        adx = self.adx(highs, lows, closes, 14)
+        sma_vol20 = sum(volumes[-20:]) / 20.0
+        recent_high20 = max(highs[-21:-1])
+        recent_low20 = min(lows[-21:-1])
+        latest_range = max(highs[-1] - lows[-1], closes[-1] * 0.0001)
+        body_ratio = abs(closes[-1] - opens[-1]) / latest_range
+        sma20 = sum(closes[-20:]) / 20.0
+        variance = sum((value - sma20) ** 2 for value in closes[-20:]) / 20.0
+        std20 = math.sqrt(variance)
+        bb_upper = sma20 + std20 * 2.0
+        bb_lower = sma20 - std20 * 2.0
+        atr_pct = atr14 / closes[-1] if closes[-1] else 0.0
+        return_24h = closes[-1] / closes[-25] - 1.0 if len(closes) > 25 and closes[-25] else 0.0
+        if ema50 > ema200 * 1.003:
+            market_regime = "bull"
+        elif ema50 < ema200 * 0.997:
+            market_regime = "bear"
+        else:
+            market_regime = "sideways"
+        if atr_pct > 0.035:
+            market_regime = f"{market_regime}_high_vol"
+        return {
+            "close": closes[-1],
+            "open": opens[-1],
+            "high": highs[-1],
+            "low": lows[-1],
+            "ema20": ema20,
+            "ema50": ema50,
+            "ema200": ema200,
+            "atr14": atr14,
+            "atr_pct": atr_pct,
+            "rsi14": rsi14,
+            "adx14": adx["adx"],
+            "plus_di14": adx["plus_di"],
+            "minus_di14": adx["minus_di"],
+            "volume": volumes[-1],
+            "volume_sma20": sma_vol20,
+            "recent_high20": recent_high20,
+            "recent_low20": recent_low20,
+            "body_ratio": body_ratio,
+            "bb_upper": bb_upper,
+            "bb_lower": bb_lower,
+            "bb_mid": sma20,
+            "return_24h": return_24h,
+            "green": closes[-1] > opens[-1],
+            "red": closes[-1] < opens[-1],
+            "market_regime": market_regime,
+        }
+
+    def strategy_decision(self, registry_row, ind):
+        strategy = str(registry_row.get("strategy", "")).lower()
+        allowed = str(registry_row.get("direction") or "both").lower()
+        close = ind["close"]
+        trend_long = close > ind["ema200"] and ind["ema50"] > ind["ema200"]
+        trend_short = close < ind["ema200"] and ind["ema50"] < ind["ema200"]
+        break_long = close > ind["recent_high20"] and ind["volume"] > ind["volume_sma20"] * 1.15
+        break_short = close < ind["recent_low20"] and ind["volume"] > ind["volume_sma20"] * 1.15
+        volume_spike = ind["volume"] > ind["volume_sma20"] * 1.6
+        strong_body = ind["body_ratio"] > 0.52
+
+        def choose(direction, condition, reason):
+            if condition and allowed in {direction, "both", ""}:
+                return {"direction": direction, "reason": reason}
+            return None
+
+        if "relative weakness" in strategy:
+            return choose("short", trend_short and (break_short or ind["return_24h"] < -0.018) and ind["red"], "relative_weakness_short")
+        if "ema 50/200" in strategy:
+            return choose("long", trend_long and (break_long or (close > ind["ema20"] and ind["green"])), "ema_trend_long") or choose(
+                "short", trend_short and (break_short or (close < ind["ema20"] and ind["red"])), "ema_trend_short"
+            )
+        if "trend pullback" in strategy:
+            return choose("long", trend_long and ind["low"] <= ind["ema50"] * 1.006 and close > ind["ema20"] and 38 <= ind["rsi14"] <= 62 and ind["green"], "trend_pullback_long") or choose(
+                "short", trend_short and ind["high"] >= ind["ema50"] * 0.994 and close < ind["ema20"] and 38 <= ind["rsi14"] <= 66 and ind["red"], "trend_pullback_short"
+            )
+        if "rsi pullback" in strategy:
+            return choose("long", trend_long and 40 <= ind["rsi14"] <= 58 and close > ind["ema20"] and ind["green"], "rsi_pullback_long") or choose(
+                "short", trend_short and 45 <= ind["rsi14"] <= 66 and close < ind["ema20"] and ind["red"], "rsi_pullback_short"
+            )
+        if "supertrend" in strategy:
+            return choose("long", trend_long and close > ind["ema20"] and ind["green"] and ind["adx14"] >= 17, "supertrend_proxy_long") or choose(
+                "short", trend_short and close < ind["ema20"] and ind["red"] and ind["adx14"] >= 17, "supertrend_proxy_short"
+            )
+        if "adx trend" in strategy:
+            return choose("long", trend_long and ind["adx14"] >= 20 and ind["plus_di14"] > ind["minus_di14"], "adx_trend_long") or choose(
+                "short", trend_short and ind["adx14"] >= 20 and ind["minus_di14"] > ind["plus_di14"], "adx_trend_short"
+            )
+        if "bollinger band trend ride" in strategy:
+            return choose("long", trend_long and close >= ind["bb_upper"] * 0.995 and ind["green"], "bb_trend_ride_long") or choose(
+                "short", trend_short and close <= ind["bb_lower"] * 1.005 and ind["red"], "bb_trend_ride_short"
+            )
+        if "volume spike" in strategy:
+            return choose("long", volume_spike and strong_body and break_long and ind["green"], "volume_spike_long") or choose(
+                "short", volume_spike and strong_body and break_short and ind["red"], "volume_spike_short"
+            )
+        if "support / resistance break" in strategy:
+            return choose("long", break_long and close > ind["ema50"], "support_resistance_break_long") or choose(
+                "short", break_short and close < ind["ema50"], "support_resistance_break_short"
+            )
+        if "funding squeeze" in strategy:
+            return None
+        return None
+
+    def ema(self, values, period):
+        alpha = 2.0 / (period + 1.0)
+        current = values[0]
+        for value in values[1:]:
+            current = value * alpha + current * (1.0 - alpha)
+        return current
+
+    def rsi(self, closes, period):
+        if len(closes) <= period:
+            return 50.0
+        gains = []
+        losses = []
+        for idx in range(len(closes) - period, len(closes)):
+            change = closes[idx] - closes[idx - 1]
+            gains.append(max(change, 0.0))
+            losses.append(abs(min(change, 0.0)))
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+        if avg_loss == 0:
+            return 100.0 if avg_gain > 0 else 50.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    def atr(self, highs, lows, closes, period):
+        if len(closes) <= period:
+            return 0.0
+        trs = []
+        for idx in range(len(closes) - period, len(closes)):
+            previous_close = closes[idx - 1]
+            trs.append(max(highs[idx] - lows[idx], abs(highs[idx] - previous_close), abs(lows[idx] - previous_close)))
+        return sum(trs) / period
+
+    def adx(self, highs, lows, closes, period):
+        if len(closes) <= period + 1:
+            return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0}
+        plus_dm = []
+        minus_dm = []
+        trs = []
+        start = len(closes) - period
+        for idx in range(start, len(closes)):
+            up_move = highs[idx] - highs[idx - 1]
+            down_move = lows[idx - 1] - lows[idx]
+            plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0.0)
+            minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0.0)
+            previous_close = closes[idx - 1]
+            trs.append(max(highs[idx] - lows[idx], abs(highs[idx] - previous_close), abs(lows[idx] - previous_close)))
+        tr_sum = sum(trs)
+        if tr_sum <= 0:
+            return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0}
+        plus_di = 100.0 * sum(plus_dm) / tr_sum
+        minus_di = 100.0 * sum(minus_dm) / tr_sum
+        denominator = plus_di + minus_di
+        adx_value = 100.0 * abs(plus_di - minus_di) / denominator if denominator else 0.0
+        return {"adx": adx_value, "plus_di": plus_di, "minus_di": minus_di}
 
     def mirror_registry(self, rows):
         if not self.driver or not rows:
